@@ -1,0 +1,70 @@
+# pg_restore_wrapper.conf - key=value, '#' comments, quotes optional.
+# Use it with: pg_restore_wrapper.sh --config /etc/pg_restore/pg_restore_wrapper.conf
+# Command-line options always override these values.
+# Keys can use - or _ (backup-schema= and backup_schema= are the same).
+# List keys take comma-separated values.
+# Passwords are NOT allowed here: use ~/.pgpass or pgpassfile=
+# If you put webhook URLs here, chmod 600 this file (they contain secret tokens).
+
+# --- connection ----------------------------------------------------------------
+host=db2.example.internal
+port=5432
+user=dba_admin
+# pgpassfile=/etc/pg_restore/.pgpass
+# maintenance_db=postgres          # where databases are listed and created
+
+# --- many servers (optional) -----------------------------------------------------
+# One "host,port,user,databases" line per server, e.g. db3.example.internal,5432,dba_admin,all
+# databases = all, or a comma list of TARGET databases to restore on that server.
+# When set, host= and port= above are ignored; -W is not allowed (use the pgpass file).
+# servers_file=/etc/pg_restore/servers.txt
+
+# --- source and mapping (nothing is guessed from file names) ---------------------
+# from=/backups/postgres/db1.example.internal_5432
+# dbname=salesdb                   # only for a single dump file
+# map=salesdb_*=salesdb,hrdb_*=hrdb  # FILE=DB, FILE is a name or shell glob; first match wins
+# map_file=/etc/pg_restore/map.txt   # one FILE=DB per line
+# include=salesdb_*                # only these files (globs)
+# exclude=*_test_*                 # skip these files (globs)
+stop_on_error=no                   # yes = stop at the first failed restore
+
+# --- restore options ------------------------------------------------------------
+jobs=4                             # custom / directory dumps only (ignored for tar)
+clean=yes
+if_exists=yes
+create=yes                         # CREATE DATABASE only when it does not exist yet
+no_owner=yes                       # Aurora/RDS: the login usually cannot become the dump's owners
+no_privileges=yes
+# role=app_owner                   # SET ROLE before restoring
+# schema_only=no
+# data_only=no
+# schemas=sales                    # pg_restore -n: the schema must already exist in the target
+# tables=sales.orders
+# exit_on_error=no
+checksum=yes                       # verify <dump>.sha256 when present
+
+# --- existing tables ------------------------------------------------------------
+# Tables in the dump that already exist in the target database.
+backup_first=yes                   # yes | dump | psql | no (no = ask on a terminal, refuse in cron)
+backup_method=dump                 # dump = pg_dump_wrapper.sh | psql = copy to <schema>.<table>_bkp_<YYYYMMDD_HHMM>
+backup_schema=public               # where psql copies go
+# backup_dir=/backups/restore-work/pre_restore_backups
+# pg_dump_wrapper=/opt/pg-tools/pg_dump_wrapper.sh
+# force=no                         # yes = overwrite without any backup (never together with backup_first)
+
+# --- approval -------------------------------------------------------------------
+# assume_yes=no                    # yes = skip the typed approval (the RESTORE SUMMARY is still logged)
+
+# --- files ----------------------------------------------------------------------
+output_dir=/backups/restore-work   # log, rollback_<date>.sh, pre-restore dump backups
+# log_file=/var/log/pg_restore_wrapper.log
+min_free_mb=5120
+# verbose=no
+# pg_bin=/usr/lib/postgresql/17/bin
+
+# --- alerts ---------------------------------------------------------------------
+alert_on=failure                   # failure | always
+alert_email=dba@example.com
+# alert_from=pg-restore@example.com
+# alert_webhook=https://hooks.slack.com/services/T000/B000/XXXXXXXX
+alert_webhook_format=slack         # slack ({"text": ...}) | json (structured)
