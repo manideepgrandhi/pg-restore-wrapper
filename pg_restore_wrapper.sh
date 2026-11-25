@@ -7,7 +7,8 @@
 # its target database explicitly (-d for one file, --map / --map-file for a folder).
 # Before anything changes it verifies .sha256 checksums, lists every existing table the
 # restore would overwrite, offers a backup of those tables (pg_dump_wrapper.sh or a psql
-# copy), prints a RESTORE SUMMARY and waits for a typed approval.
+# copy; the copies are kept for manual recovery), prints a RESTORE SUMMARY and waits for
+# a typed approval.
 #
 # Exit codes (for multi-file / multi-server runs: the highest code of any row):
 #   0    success
@@ -59,8 +60,6 @@ readonly SERVERS_ALL_KEYWORD="all"
 readonly SERVERS_LINE_FORMAT="host,port,user,databases"
 readonly DEFAULT_LOG_NAME="pg_restore_wrapper.log"
 readonly DEFAULT_BACKUP_SUBDIR="pre_restore_backups"
-readonly ROLLBACK_FILE_PREFIX="rollback_"
-readonly ROLLBACK_FILE_EXT=".sh"
 readonly DUMP_WRAPPER_NAME="pg_dump_wrapper.sh"
 readonly DUMP_WRAPPER_DONE_RE='Backup completed successfully: (.*)$'
 readonly APPROVE_SERVERS_WORD="RESTORE"
@@ -145,8 +144,7 @@ declare -A SRC_TABLES=()                 # src index -> "schema<FS>table" lines
 U_SRV=(); U_SRC=(); U_DB=(); U_STATE=(); U_OVERLAP=(); U_PRE_RC=(); U_PRE_STAGE=(); U_PRE_MSG=()
 declare -A BK_NEED=()                    # "srv|db" -> "schema<FS>table" lines (unique)
 BK_KEYS=()                               # insertion order of BK_NEED keys
-BK_ROWS=()                               # "srv|db|method|schema<FS>table|target|rows"; psql target = "schema<FS>table"
-declare -A BK_COLS=()                    # BK_ROWS index -> quoted column list (psql copies; generated columns left out)
+BK_ROWS=()                               # "srv|db|method|schema<FS>table|target|rows"; dump target = file path; psql target = "schema<FS>bkp_table"
 declare -A BK_USED=()
 declare -A CREATED=()
 BACKUP_STATE="none"                      # none | planned | done | skipped | forced
@@ -162,7 +160,6 @@ CHILD_PID=""
 CUR_UNIT=-1
 WORST=0
 FIRST_FAIL=""
-ROLLBACK_FILE=""
 SRV_ERR=""
 
 # ----------------------------------------------------------------------------
@@ -277,7 +274,7 @@ Approval:
                                name, or '$APPROVE_SERVERS_WORD N' with --servers (N = servers restored to)
 
 Files:
-  -o, --output-dir DIR         Folder for the log, rollback file and dump backups (default: .)
+  -o, --output-dir DIR         Folder for the log and dump backups (default: .)
   -l, --log-file FILE          Log file (default: OUTPUT_DIR/$DEFAULT_LOG_NAME)
       --min-free-mb N          Warn if free space in OUTPUT_DIR is below N MB (default: 1024)
 
@@ -945,7 +942,7 @@ backup_text() {
     case "$BACKUP_STATE" in
         planned) if [[ "$CHOSEN_METHOD" == psql ]]; then printf '%d table(s) psql copy -> %s.<table>%s%s' "$count" "$BACKUP_SCHEMA" "$BACKUP_NAME_TAG" "$RUN_STAMP"
                  else printf '%d table(s) via %s -> %s/' "$count" "$DUMP_WRAPPER_NAME" "$BACKUP_DIR"; fi ;;
-        done)    printf '%d table(s) already backed up (%s); rollback commands are printed at the end' "$count" "$CHOSEN_METHOD" ;;
+        done)    printf '%d table(s) already backed up (%s); locations are printed at the end' "$count" "$CHOSEN_METHOD" ;;
         skipped) printf 'NONE - %s %d confirmed, %d table(s) overwritten without a backup' "$APPROVE_OVERWRITE_WORD" "$count" "$count" ;;
         forced)  printf 'NONE - --force, %d table(s) overwritten without a backup' "$count" ;;
         *)       printf '%d table(s) need a backup' "$count" ;;
@@ -1083,7 +1080,6 @@ run_backups() {   # run_backups <method>  -> 0 ok, 5 any failure (stops at the f
                 (( rc == 0 )) || { backup_fail "$db" $(( SECONDS - start )) "psql copy of $sch.$tbl failed: ${out//$'\n'/ }"; return 5; }
                 rows="$(grep -oE '^INSERT 0 [0-9]+' <<<"$out" | awk '{print $3}')" || rows=""
                 log_info "psql copy OK: $BACKUP_SCHEMA.$BK_NAME (${rows:-?} rows)"
-                BK_COLS[${#BK_ROWS[@]}]="$cols"
                 BK_ROWS+=("$s|$db|psql|$sch$FIELD_SEP$tbl|$BACKUP_SCHEMA$FIELD_SEP$BK_NAME|${rows:-?}")
             done <<<"${BK_NEED[$k]}"
         fi
@@ -1107,158 +1103,23 @@ print_backup_commands() {   # shown when the run refuses to overwrite
     log_info "or re-run with --backup-first (dump), --backup-first=psql, or --force to skip the backup."
 }
 
-# shellcheck disable=SC2329  # called from the EXIT trap via write_rollback
-incoming_fks() {   # incoming_fks <db> <schema> <table> -> "schema<FS>table<FS>conname" lines
-    psql_q "$1" "SELECT n.nspname, c.relname, con.conname
-        FROM pg_constraint con
-        JOIN pg_class c ON c.oid = con.conrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_class f ON f.oid = con.confrelid
-        JOIN pg_namespace fn ON fn.oid = f.relnamespace
-        WHERE con.contype = 'f'
-          AND fn.nspname = $(quote_literal "$2") AND f.relname = $(quote_literal "$3")
-          AND NOT (n.nspname = fn.nspname AND c.relname = f.relname)
-        ORDER BY 1, 2, 3"
-}
-
-psql_rollback_block() {   # psql_rollback_block <srv> <db> <comma-separated BK_ROWS indices>
-    local s="$1" db="$2" host i r method tbl target rows sch name line fk_sch fk_rest fk_tbl fk_con pretty
-    local -a idx=() schs=() nams=() srcs=() dsts=() colsl=() rowsl=() drop=() safe=() blocked=()
-    local -A in_set=() ext_of=() int_of=()
-    local has_internal=0 out
-    IFS=',' read -ra idx <<<"$3"
-    use_server "$s"
-    host="${SRV_HOSTS[$s]}:${SRV_PORTS[$s]}"
-    for i in "${idx[@]}"; do
-        r="${BK_ROWS[$i]}"
-        IFS='|' read -r s db method tbl target rows <<<"$r"
-        sch="${tbl%%"$FIELD_SEP"*}"; name="${tbl#*"$FIELD_SEP"}"
-        in_set["$sch$FIELD_SEP$name"]=1
-        schs+=("$sch"); nams+=("$name")
-        srcs+=("$(qname "$sch" "$name")")
-        dsts+=("$(qname "${target%%"$FIELD_SEP"*}" "${target#*"$FIELD_SEP"}")")
-        colsl+=("${BK_COLS[$i]}")
-        rowsl+=("$rows")
-        drop+=("$(qname "${target%%"$FIELD_SEP"*}" "${target#*"$FIELD_SEP"}")")
-    done
-    for i in "${!schs[@]}"; do
-        out="$(incoming_fks "$db" "${schs[$i]}" "${nams[$i]}")" || out=""
-        local external="" internal=""
-        while IFS= read -r line; do
-            [[ -n "$line" ]] || continue
-            fk_sch="${line%%"$FIELD_SEP"*}"; fk_rest="${line#*"$FIELD_SEP"}"
-            fk_tbl="${fk_rest%%"$FIELD_SEP"*}"; fk_con="${fk_rest#*"$FIELD_SEP"}"
-            pretty="${fk_sch}.${fk_tbl} (${fk_con})"
-            if [[ -n "${in_set[$fk_sch$FIELD_SEP$fk_tbl]:-}" ]]; then
-                internal+="${internal:+, }$pretty"; has_internal=1
-            else
-                external+="${external:+, }$pretty"
-            fi
-        done <<<"$out"
-        ext_of[$i]="$external"
-        int_of[$i]="$internal"
-        if [[ -n "$external" ]]; then blocked+=("$i"); else safe+=("$i"); fi
-    done
-
-    if (( ${#safe[@]} )); then
-        local list="" j
-        for i in "${safe[@]}"; do list+="${list:+, }${schs[$i]}.${nams[$i]}"; done
-        printf '# %s/%s  psql copies (%s)\n' "$host" "$db" "$list"
-        printf "psql -h %s -p %s -U %s -d %s -v ON_ERROR_STOP=1 <<'SQL'\n" "${SRV_HOSTS[$s]}" "${SRV_PORTS[$s]}" "${SRV_USERS[$s]:-$BASE_USER}" "$(printf '%q' "$db")"
-        printf 'BEGIN;\n'
-        if (( has_internal )); then
-            local tr="" notes=""
-            for i in "${safe[@]}"; do
-                tr+="${tr:+, }${srcs[$i]}"
-                [[ -n "${int_of[$i]}" ]] && notes+="${notes:+; }${schs[$i]}.${nams[$i]} referenced by ${int_of[$i]}"
-            done
-            printf '%s\n' "-- Truncated together because of foreign keys: $notes"
-            printf 'TRUNCATE %s;\n' "$tr"
-            # INSERT referenced tables first (parent before child)
-            local -a indeg=() order=() q=()
-            local -A children=()
-            for i in "${safe[@]}"; do indeg[i]=0; children[$i]=""; done
-            for i in "${safe[@]}"; do
-                while IFS= read -r line; do
-                    [[ -n "$line" ]] || continue
-                    fk_sch="${line%%"$FIELD_SEP"*}"; fk_rest="${line#*"$FIELD_SEP"}"
-                    fk_tbl="${fk_rest%%"$FIELD_SEP"*}"
-                    [[ -n "${in_set[$fk_sch$FIELD_SEP$fk_tbl]:-}" ]] || continue
-                    # fk table references schs[i].nams[i], so parent is i, child is the fk table
-                    for j in "${safe[@]}"; do
-                        [[ "${schs[$j]}" == "$fk_sch" && "${nams[$j]}" == "$fk_tbl" ]] || continue
-                        children[$i]+="${children[$i]:+ }$j"
-                        indeg[j]=$(( ${indeg[j]:-0} + 1 ))
-                    done
-                done <<<"$(incoming_fks "$db" "${schs[$i]}" "${nams[$i]}")"
-            done
-            for i in "${safe[@]}"; do (( ${indeg[i]:-0} == 0 )) && q+=("$i"); done
-            while (( ${#q[@]} )); do
-                i="${q[0]}"; q=("${q[@]:1}")
-                order+=("$i")
-                for j in ${children[$i]}; do
-                    indeg[j]=$(( indeg[j] - 1 ))
-                    (( indeg[j] == 0 )) && q+=("$j")
-                done
-            done
-            for i in "${safe[@]}"; do
-                already=0
-                for j in "${order[@]}"; do [[ "$j" == "$i" ]] && already=1; done
-                (( already )) || order+=("$i")   # leftover cycle
-            done
-            for i in "${order[@]}"; do
-                printf 'INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM %s;\n' "${srcs[$i]}" "${colsl[$i]}" "${colsl[$i]}" "${dsts[$i]}"
-            done
-        else
-            for i in "${safe[@]}"; do
-                printf 'TRUNCATE %s;\nINSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM %s;\n' \
-                    "${srcs[$i]}" "${srcs[$i]}" "${colsl[$i]}" "${colsl[$i]}" "${dsts[$i]}"
-            done
-        fi
-        printf 'COMMIT;\n'
-        for i in "${safe[@]}"; do
-            printf '%s\n' "-- when no longer needed: DROP TABLE ${drop[$i]};"
-        done
-        printf 'SQL\n\n'
-    fi
-
-    for i in "${blocked[@]}"; do
-        printf '# WARNING: %s/%s %s.%s is referenced by %s.\n' "$host" "$db" "${schs[$i]}" "${nams[$i]}" "${ext_of[$i]}"
-        printf '# A plain TRUNCATE of this table will fail. Use --backup-first (dump) for a rollback that replaces the whole set.\n'
-        printf '# If you accept emptying the referencing tables too (they are NOT in this backup), you could instead run:\n'
-        printf "#   psql -h %s -p %s -U %s -d %s -v ON_ERROR_STOP=1 <<'SQL'\n" "${SRV_HOSTS[$s]}" "${SRV_PORTS[$s]}" "${SRV_USERS[$s]:-$BASE_USER}" "$(printf '%q' "$db")"
-        printf '#   BEGIN;\n'
-        printf '#   TRUNCATE %s CASCADE;   -- also empties: %s\n' "${srcs[$i]}" "${ext_of[$i]}"
-        printf '#   INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM %s;\n' "${srcs[$i]}" "${colsl[$i]}" "${colsl[$i]}" "${dsts[$i]}"
-        printf '#   COMMIT;\n'
-        printf '#   -- when no longer needed: DROP TABLE %s;\n' "${drop[$i]}"
-        printf '#   SQL\n\n'
-    done
-}
-
-rollback_text() {
-    local i r s db method tbl target rows host self key
+backup_list_text() {   # where each pre-restore backup was saved (locations of pre-restore backups)
+    local i r s db method tbl target rows sch name host
     (( ${#BK_ROWS[@]} )) || return 0
-    self="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$SCRIPT_NAME"
-    local -A dump_done=() psql_ids=()
-    local -a psql_keys=()
+    local -A dump_done=()
     for i in "${!BK_ROWS[@]}"; do
         r="${BK_ROWS[$i]}"
         IFS='|' read -r s db method tbl target rows <<<"$r"
         host="${SRV_HOSTS[$s]}:${SRV_PORTS[$s]}"
-        if [[ "$method" != psql ]]; then
+        if [[ "$method" == dump ]]; then
             [[ -n "${dump_done[$target]:-}" ]] && continue
             dump_done[$target]=1
-            printf '# %s/%s  (%s backup -> %s)\n' "$host" "$db" "$DUMP_WRAPPER_NAME" "$target"
-            printf '%s\n\n' "$(print_cmd bash "$self" -h "${SRV_HOSTS[$s]}" -p "${SRV_PORTS[$s]}" -U "${SRV_USERS[$s]:-$BASE_USER}" --from "$target" -d "$db" --clean --if-exists --force)"
-            continue
+            printf '  [dump] %s/%s  %s\n' "$host" "$db" "$target"
+        else
+            sch="${tbl%%"$FIELD_SEP"*}"; name="${tbl#*"$FIELD_SEP"}"
+            printf '  [psql] %s/%s  %s.%s  (copy of %s.%s, %s rows)\n' \
+                "$host" "$db" "${target%%"$FIELD_SEP"*}" "${target#*"$FIELD_SEP"}" "$sch" "$name" "$rows"
         fi
-        key="$s|$db"
-        if [[ -z "${psql_ids[$key]+x}" ]]; then psql_keys+=("$key"); psql_ids[$key]="$i"
-        else psql_ids[$key]+=",$i"; fi
-    done
-    for key in "${psql_keys[@]}"; do
-        psql_rollback_block "${key%%|*}" "${key#*|}" "${psql_ids[$key]}"
     done
 }
 
@@ -1446,7 +1307,7 @@ build_alert_body() {
         printf 'Duration   : %s\n' "$(fmt_duration $(( SECONDS - RUN_START )))"
         printf 'Output dir : %s\n' "$OUTPUT_DIR"
         printf 'Log file   : %s\n' "$LOG_FILE"
-        [[ -n "$ROLLBACK_FILE" ]] && printf 'Rollback   : %s\n' "$ROLLBACK_FILE"
+        (( ${#BK_ROWS[@]} )) && { printf '\nPre-restore backups:\n'; backup_list_text; }
         (( ${#RESULTS[@]} )) && { printf '\n'; summary_lines; }
         if (( rc != 0 )) && [[ -r "$LOG_FILE" ]]; then printf '\nLast %s log lines:\n' "$ALERT_LOG_LINES"; tail -n "$ALERT_LOG_LINES" "$LOG_FILE"; fi
     } | redact_text
@@ -1466,10 +1327,10 @@ build_alert_json() {
             "$(json_escape "$db")" "$(json_escape "$drc")" "$(json_escape "$stage")" "$(json_escape "$size")" "$(json_escape "$dur")" "$(json_escape "$file")")"
     done < <(sorted_results)
     if (( rc != 0 )) && [[ -r "$LOG_FILE" ]]; then tailtxt="$(tail -n "$ALERT_LOG_LINES" "$LOG_FILE" | redact_text)"; fi
-    printf '{"status":"%s","exit_code":%d,"failed_stage":"%s","host":"%s","server":"%s","source":"%s","started":"%s","duration_seconds":%d,"output_dir":"%s","log_file":"%s","rollback_file":"%s","databases":[%s],"log_tail":"%s","text":"%s"}' \
+    printf '{"status":"%s","exit_code":%d,"failed_stage":"%s","host":"%s","server":"%s","source":"%s","started":"%s","duration_seconds":%d,"output_dir":"%s","log_file":"%s","databases":[%s],"log_tail":"%s","text":"%s"}' \
         "$(json_escape "$status")" "$rc" "$( (( rc != 0 )) && json_escape "$STAGE")" "$(json_escape "$(host_name)")" "$(json_escape "$(server_list)")" \
         "$(json_escape "$FROM")" "$(json_escape "$RUN_START_TS")" $(( SECONDS - RUN_START )) "$(json_escape "$OUTPUT_DIR")" "$(json_escape "$LOG_FILE")" \
-        "$(json_escape "$ROLLBACK_FILE")" "$rows" "$(json_escape "$tailtxt")" "$(json_escape "$body")"
+        "$rows" "$(json_escape "$tailtxt")" "$(json_escape "$body")"
 }
 
 send_email_alert() {
@@ -1519,15 +1380,11 @@ send_alerts() {
 }
 
 # shellcheck disable=SC2329  # called from the EXIT trap
-write_rollback() {
-    local txt; txt="$(rollback_text)"
+write_backup_list() {
+    local txt; txt="$(backup_list_text)"
     [[ -n "$txt" ]] || return 0
-    log_info "Rollback commands (from the pre-restore backup):"
+    log_info "Pre-restore backups saved:"
     printf '%s\n' "$txt" | log_block
-    ROLLBACK_FILE="$OUTPUT_DIR/$ROLLBACK_FILE_PREFIX$(date '+%Y%m%d_%H%M%S')$ROLLBACK_FILE_EXT"
-    if printf '#!/usr/bin/env bash\n# Rollback for the pg_restore_wrapper run started %s. Review before running: bash %s\nset -e\n\n%s\n' "$RUN_START_TS" "$ROLLBACK_FILE" "$txt" >"$ROLLBACK_FILE" 2>/dev/null; then
-        log_info "Rollback commands saved (review, then run with bash): $ROLLBACK_FILE"
-    else ROLLBACK_FILE=""; fi
 }
 
 # shellcheck disable=SC2317  # called from the EXIT trap
@@ -1539,7 +1396,7 @@ on_exit() {
     set +e
     SERVER_LABEL=""; DB_NAME=""
     (( MAIN_STARTED )) || exit "$rc"
-    write_rollback
+    write_backup_list
     if (( ${#RESULTS[@]} )); then log_info "Summary:"; while IFS= read -r l; do _log INFO "  $l"; done < <(summary_lines); fi
     if (( CANCELLED )); then _log WARN "Cancelled - nothing was restored"; exit "$rc"; fi
     if (( rc == 0 )); then _log INFO "Run finished OK in $(fmt_duration $(( SECONDS - RUN_START )))"
