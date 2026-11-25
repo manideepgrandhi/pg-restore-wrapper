@@ -194,10 +194,7 @@ check "two orders tables -> two copies, no collision" test "$(q "$PORT" t_src "S
 BKO="$(q "$PORT" t_src "SELECT 'public.'||quote_ident(relname) FROM pg_class c WHERE relname ~ '^orders_bkp_' AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attname='note')")"
 check "the sales.orders copy has the CHANGED row" test "$(q "$PORT" t_src "SELECT note FROM $BKO WHERE id=1")" = CHANGED
 check "restore replaced the data" test "$(q "$PORT" t_src "SELECT note FROM sales.orders WHERE id=1")" = "order 1"
-RB="$(grep -oE "Rollback commands saved \(review, then run with bash\): .*" <<<"$OUT" | sed 's/.*: //')"
-check "rollback file written with TRUNCATE/INSERT SQL" bash -c '[[ -s "$1" ]] && grep -q "TRUNCATE \"sales\".\"orders\";" "$1" && grep -q "OVERRIDING SYSTEM VALUE" "$1"' _ "$RB"
-PGPASSFILE="$PGPASS" bash "$RB" >/dev/null 2>&1
-check "running the rollback file brings the old row back" test "$(q "$PORT" t_src "SELECT note FROM sales.orders WHERE id=1")" = CHANGED
+check "end of run lists the psql backup table names" bash -c 'grep -q "Pre-restore backups saved:" <<<"$1" && grep -qE "\[psql\] 127\.0\.0\.1:[0-9]+/t_src +public\.orders_bkp_" <<<"$1" && grep -q "copy of sales.orders" <<<"$1"' _ "$OUT"
 
 printf 'backup_method=psql\nbackup_schema=bk_restore\n' >"$T/psql.conf"
 run --config "$T/psql.conf" "${C[@]}" --from "$SRC_NEW" -d t_src --clean --if-exists --backup-first --yes
@@ -217,10 +214,7 @@ run "${C[@]}" --from "$GEN_DUMP" -d gen --clean --if-exists --backup-first=psql 
 check "psql copy works on a table with a generated column" bash -c '[[ $1 -eq 0 ]] && grep -q "psql copy OK: public.prices_bkp_.* (2 rows)" <<<"$2"' _ "$RC" "$OUT"
 GEN_BK="$(q "$PORT" gen "SELECT relname FROM pg_class WHERE relkind = 'r' AND relname LIKE 'prices_bkp_%'")"
 check "copy holds the old row with its generated value" test "$(q "$PORT" gen "SELECT net || '/' || gross FROM public.\"$GEN_BK\" WHERE id = 1")" = "999/1178.82"
-RB="$(grep -oE "Rollback commands saved \(review, then run with bash\): .*" <<<"$OUT" | sed 's/.*: //')"
-check "rollback lists only the non-generated columns" grep -q 'INSERT INTO "public"."prices" (id, net) OVERRIDING SYSTEM VALUE SELECT id, net FROM' "$RB"
-PGPASSFILE="$PGPASS" bash "$RB" >/dev/null 2>&1
-check "rollback on a generated-column table brings net=999 back" test "$(q "$PORT" gen "SELECT net || '/' || gross FROM public.prices WHERE id = 1")" = "999/1178.82"
+check "generated-column backup is listed at the end" bash -c 'grep -q "Pre-restore backups saved:" <<<"$1" && grep -qE "\[psql\] .* public\.prices_bkp_.*copy of public.prices" <<<"$1"' _ "$OUT"
 
 section "--backup-first (dump, via pg_dump_wrapper.sh)"
 q "$PORT" t_src "UPDATE sales.orders SET note='CHANGED2' WHERE id=2" >/dev/null
@@ -230,7 +224,7 @@ BF="$(ls "$OUTD/pre_restore_backups/${H}_${PORT}"/t_src_*.dump 2>/dev/null | tai
 check "backup file written by pg_dump_wrapper with checksum" bash -c '[[ -s "$1" && -s "$1.sha256" ]]' _ "$BF"
 check "backup file holds exactly the existing tables" bash -c '[[ $("$1"/pg_restore -l "$2" | grep -c " TABLE DATA ") -eq 4 ]]' _ "$CLIENT_BIN" "$BF"
 check "backup has the pre-restore row" bash -c '"$1"/pg_restore -a -t orders -n sales -f - "$2" | grep -q CHANGED2' _ "$CLIENT_BIN" "$BF"
-check "rollback command printed (restore the backup file)" bash -c 'grep -qE "pg_restore_wrapper.sh -h 127.0.0.1 -p [0-9]+ -U aurora_admin --from .*t_src_[0-9_]+\.dump -d t_src --clean --if-exists --force" <<<"$1"' _ "$OUT"
+check "end of run lists the dump backup file path" bash -c 'grep -q "Pre-restore backups saved:" <<<"$1" && grep -qE "\[dump\] 127\.0\.0\.1:[0-9]+/t_src +/.*t_src_[0-9_]+\.dump" <<<"$1"' _ "$OUT"
 
 printf '#!/usr/bin/env bash\necho "[ERROR] simulated backup failure" >&2\nexit 3\n' >"$T/fake_pdw.sh"
 q "$PORT" t_src "UPDATE sales.orders SET note='KEEP' WHERE id=3" >/dev/null
@@ -325,32 +319,6 @@ run "${SC[@]}" --servers "$SV" --from "$D" --map 'src_*=srv_src' -h "$H"
 check "-h with --servers -> exit 1" test "$RC" -eq 1
 
 # ----------------------------------------------------------------------------
-
-# ----------------------------------------------------------------------------
-section "psql rollback handles incoming foreign keys"
-q "$PORT" postgres "CREATE DATABASE fksrc OWNER $AR" >/dev/null
-PGPASSFILE="$PGPASS" "$CLIENT_BIN/psql" -X -q -h "$H" -p "$PORT" -U "$AR" -d fksrc -v ON_ERROR_STOP=1 <<'SQL'
-CREATE TABLE public.parent(id int PRIMARY KEY, name text);
-CREATE TABLE public.child(id int PRIMARY KEY, parent_id int REFERENCES public.parent(id), note text);
-INSERT INTO public.parent VALUES (1,'a'),(2,'b');
-INSERT INTO public.child VALUES (1,1,'c1'),(2,2,'c2');
-SQL
-bash "$PDW" "${PDWC[@]}" -d fksrc -O -o "$T/fk" >/dev/null 2>&1
-FK_DUMP="$(printf '%s\n' "$T"/fk/fksrc_*.dump | head -n1)"
-run "${C[@]}" --from "$FK_DUMP" -d t_fk --create --yes
-check "FK source restored into t_fk" test "$RC" -eq 0
-run "${C[@]}" --from "$FK_DUMP" -d t_fk --clean --if-exists --backup-first=psql --yes
-check "psql backup of parent+child (internal FKs) succeeds" test "$RC" -eq 0
-RB="$(grep -oE "Rollback commands saved \(review, then run with bash\): .*" <<<"$OUT" | sed 's/.*: //')"
-check "internal-FK rollback uses one TRUNCATE of both tables" bash -c 'grep -q "Truncated together because of foreign keys" "$1" && grep -q "TRUNCATE " "$1" && ! grep -q "CASCADE" "$1"' _ "$RB"
-PGPASSFILE="$PGPASS" bash "$RB" >/dev/null 2>&1
-check "internal-FK rollback script runs" test "$?" -eq 0
-PGPASSFILE="$PGPASS" "$CLIENT_BIN/psql" -X -q -h "$H" -p "$PORT" -U "$AR" -d t_fk -c "CREATE TABLE public.audit(id int PRIMARY KEY, parent_id int REFERENCES public.parent(id), ev text); INSERT INTO public.audit VALUES (1,1,'e')" >/dev/null
-run "${C[@]}" --from "$FK_DUMP" -d t_fk -t parent --data-only --backup-first=psql --yes
-check "psql backup of only parent (external FKs) is taken before the data-only restore" bash -c 'grep -q "psql copy OK: public.parent_bkp_" <<<"$1"' _ "$OUT"
-RB="$(grep -oE "Rollback commands saved \(review, then run with bash\): .*" <<<"$OUT" | sed 's/.*: //')"
-check "external-FK rollback warns and recommends the dump method" bash -c 'grep -q "WARNING:" "$1" && grep -q "referenced by" "$1" && grep -q "Use --backup-first (dump)" "$1" && grep -q "TRUNCATE .* CASCADE" "$1"' _ "$RB"
-check "external-FK rollback is commented, not a runnable TRUNCATE" bash -c '! grep -v "^#" "$1" | grep -q TRUNCATE' _ "$RB"
 
 # ----------------------------------------------------------------------------
 section "Alerts (webhook and e-mail via a fake mailer on PATH)"
