@@ -371,6 +371,7 @@ tty_ask() {   # tty_ask <prompt> <var>
     { exec {fd}<>"$TTY_DEVICE"; } 2>/dev/null || return 1
     printf '%s' "$1" >&"$fd"
     IFS= read -r -u "$fd" _ans || true
+    printf '\n' >&"$fd"
     exec {fd}>&-
     _ans="$(trim "${_ans%"$CR"}")"
     _log INFO "Answer: ${_ans:-<empty>}"
