@@ -107,8 +107,8 @@ check "test dumps made with pg_dump_wrapper (2 src, 1 hr dir, checksums)" \
     bash -c '[[ $(ls "$1"/src_*.dump | wc -l) -eq 2 && -d $(ls -d "$1"/hr_*.dir) && $(ls "$1"/*.sha256 | wc -l) -eq 2 ]]' _ "$D"
 SRC_NEW=""; for f in "$D"/src_2*.dump; do [[ "$f" == *20200101* ]] || SRC_NEW="$f"; done
 OUTD="$T/out"
-C=(-h "$H" -p "$PORT" -U "$AR" --pgpassfile "$PGPASS" --min-free-mb 1 --pg-dump-wrapper "$PDW" -o "$OUTD" --no-owner)
-C_OWNER=(-h "$H" -p "$PORT" -U "$AR" --pgpassfile "$PGPASS" --min-free-mb 1 -o "$OUTD")
+C=(-h "$H" -p "$PORT" -U "$AR" --pgpassfile "$PGPASS" --min-free-mb 1 --pg-dump-wrapper "$PDW" -o "$OUTD")
+C_OWNER=(-h "$H" -p "$PORT" -U "$AR" --pgpassfile "$PGPASS" --min-free-mb 1 -o "$OUTD" --keep-owner)
 MAPS=(--map 'src_*=t_src' --map 'hr_*=t_hr')
 
 # ----------------------------------------------------------------------------
@@ -134,6 +134,12 @@ check "dry-run exits 0" test "$RC" -eq 0
 check "dry-run shows RESTORE SUMMARY with both files" bash -c 'grep -q "RESTORE SUMMARY" <<<"$1" && grep -qE "src_2[0-9_]+\.dump +-> t_src +\(new, will be created\)" <<<"$1" && grep -qE "hr_[0-9_]+\.dir +-> t_hr" <<<"$1"' _ "$OUT"
 check "dry-run skips the older dump of the same database" has "Skipping older dump (a newer file of the same dump is selected): $D/src_20200101_000000.dump"
 check "dry-run prints the CREATE DATABASE and pg_restore commands" bash -c 'grep -q "CREATE DATABASE \\\\\"t_src\\\\\"\|CREATE\\\\ DATABASE" <<<"$1" && grep -qE "pg_restore -h 127.0.0.1 .* -d t_hr .*--jobs=2 --clean --if-exists" <<<"$1"' _ "$OUT"
+check "default is --no-owner (options and pg_restore)" bash -c 'grep -qE "Options +: .*--no-owner" <<<"$1" && grep -qE "pg_restore .*--no-owner" <<<"$1" && ! grep -q -- "--keep-owner" <<<"$1"' _ "$OUT"
+run "${C[@]}" --from "$D" "${MAPS[@]}" --create --clean --if-exists --keep-owner --dry-run
+check "--keep-owner is shown and pg_restore does not get --no-owner" bash -c 'grep -qE "Options +: .*--keep-owner" <<<"$1" && grep -q "pg_restore " <<<"$1" && ! grep -qE "pg_restore .*--no-owner" <<<"$1"' _ "$OUT"
+printf 'keep_owner=yes\n' >"$T/keep.conf"
+run --config "$T/keep.conf" "${C[@]}" --from "$SRC_NEW" -d t_src --create --dry-run
+check "conf keep_owner=yes opts out of the default" bash -c 'grep -qE "Options +: .*--keep-owner" <<<"$1"' _ "$OUT"
 check "dry-run says approval would be required" has "approval would be required: type $H"
 check "dry-run wrote no files and created no database" bash -c '[[ ! -e "$1" ]] && [[ -z "$2" ]]' _ "$T/dry" "$(q "$PORT" postgres "SELECT 1 FROM pg_database WHERE datname='t_src'")"
 
@@ -147,7 +153,7 @@ check "refusal created nothing" test -z "$(q "$PORT" postgres "SELECT 1 FROM pg_
 # ----------------------------------------------------------------------------
 section "Restore a dump-wrapper folder as a non-superuser (--create, --yes)"
 run "${C_OWNER[@]}" --from "$SRC_NEW" -d t_owner --create --yes
-check "non-superuser without --no-owner -> FAIL(3) with an Aurora hint" bash -c '[[ $1 -eq 3 ]] && grep -q "must be able to SET ROLE" <<<"$2" && grep -q "Re-run with --no-owner" <<<"$2"' _ "$RC" "$OUT"
+check "non-superuser with --keep-owner -> FAIL(3) with an Aurora hint" bash -c '[[ $1 -eq 3 ]] && grep -q "must be able to SET ROLE" <<<"$2" && grep -q "Re-run without --keep-owner" <<<"$2"' _ "$RC" "$OUT"
 run "${C[@]}" --from "$D" "${MAPS[@]}" --create --no-privileges -j 2 --yes
 check "folder restore exits 0" test "$RC" -eq 0
 check "checksums verified" bash -c 'grep -q "Checksum OK: src_2" <<<"$1" && grep -q "Checksum OK: hr_" <<<"$1"' _ "$OUT"
@@ -166,9 +172,17 @@ check "--yes with existing tables -> exit 2" bash -c '[[ $1 -eq 2 ]] && grep -q 
 check "warning lists the existing tables" has "public.orders, public.regions, sales.customers, sales.orders"
 check "refusal prints the pg_dump_wrapper backup command" bash -c 'grep -qE "pg_dump_wrapper.sh -h 127.0.0.1 .* -d t_src .*-t \\\\\"sales\\\\\".\\\\\"orders\\\\\"|pg_dump_wrapper.sh .* -t .*sales.*orders" <<<"$1"' _ "$OUT"
 check "data untouched after refusal" test "$(q "$PORT" t_src "SELECT note FROM sales.orders WHERE id=1")" = CHANGED
-check "--clean set -> no 'already exists' warning" bash -c '! grep -q "clean is not set" <<<"$1"' _ "$OUT"
+check "--clean set -> no no-clean refusal" bash -c '! grep -q "clean is not set" <<<"$1"' _ "$OUT"
 run "${C[@]}" --from "$SRC_NEW" -d t_src --yes
-check "existing tables without --clean -> warns to add --clean --if-exists" bash -c '[[ $1 -eq 2 ]] && grep -q "\-\-clean is not set" <<<"$2" && grep -q "add --clean --if-exists" <<<"$2"' _ "$RC" "$OUT"
+check "existing tables without --clean -> refuse exit 2, nothing restored" bash -c '[[ $1 -eq 2 ]] && grep -q "\-\-clean is not set" <<<"$2" && grep -q "Re-run with --clean --if-exists" <<<"$2" && grep -q "Nothing was restored" <<<"$2"' _ "$RC" "$OUT"
+check "no-clean refusal does not ask about backups" bash -c '! grep -q "Back them up first" <<<"$1" && ! grep -q "Starting pre-restore backups" <<<"$1"' _ "$OUT"
+check "data untouched after no-clean refusal" test "$(q "$PORT" t_src "SELECT note FROM sales.orders WHERE id=1")" = CHANGED
+run "${C[@]}" --from "$SRC_NEW" -d t_src --backup-first --yes
+check "--backup-first without --clean still refuses and takes no backup" bash -c '[[ $1 -eq 2 ]] && grep -q "\-\-clean is not set" <<<"$2" && ! grep -q "Starting pre-restore backups" <<<"$2"' _ "$RC" "$OUT"
+run "${C[@]}" --from "$SRC_NEW" -d t_src --force --yes
+check "--force without --clean still refuses" bash -c '[[ $1 -eq 2 ]] && grep -q "\-\-clean is not set" <<<"$2"' _ "$RC" "$OUT"
+run "${C[@]}" --from "$SRC_NEW" -d t_src --data-only --yes
+check "--data-only skips the no-clean refusal and still requires a backup or --force" bash -c '[[ $1 -eq 2 ]] && ! grep -q "\-\-clean is not set" <<<"$2" && grep -q "never overwrites tables without a backup" <<<"$2"' _ "$RC" "$OUT"
 
 # ----------------------------------------------------------------------------
 section "--backup-first=psql (copies into public, name collision gets _2)"
@@ -270,23 +284,38 @@ check "plain .sql.gz restored with gzip | psql" bash -c '[[ $1 -eq 0 ]] && [[ $2
 run "${C[@]}" --from "$D" --include 'src_2020*' --map 'src_*=t_old' --create --yes
 check "--include pins the older dump (5 regions)" bash -c '[[ $1 -eq 0 ]] && [[ $2 -eq 5 ]] && grep -q "No checksum file for src_20200101_000000.dump" <<<"$3"' _ "$RC" "$(q "$PORT" t_old "SELECT count(*) FROM regions")" "$OUT"
 printf '# file=db\nsrc_*=t_n\n' >"$T/map.txt"
-q "$PORT" postgres "CREATE DATABASE t_n OWNER $AR" >/dev/null
-PGPASSFILE="$PGPASS" "$CLIENT_BIN/psql" -X -q -h "$H" -p "$PORT" -U "$AR" -d t_n -c "CREATE SCHEMA sales" >/dev/null   # -n restores objects in the schema, not the schema itself (pg_restore)
-run "${C[@]}" --from "$D" --exclude 'hr_*' --map-file "$T/map.txt" -n sales --yes
-check "--map-file + --exclude + -n sales" bash -c '[[ $1 -eq 0 ]] && [[ $2 == "t|f" ]]' _ "$RC" "$(q "$PORT" t_n "SELECT (to_regclass('sales.orders') IS NOT NULL)::text || '|' || (to_regclass('public.regions') IS NOT NULL)::text" | sed 's/true/t/;s/false/f/;s/true/t/;s/false/f/')"
+run "${C[@]}" --from "$D" --exclude 'hr_*' --map-file "$T/map.txt" -n sales --create --dry-run
+check "dry-run with -n shows CREATE SCHEMA IF NOT EXISTS sales" bash -c 'grep -q "CREATE SCHEMA IF NOT EXISTS" <<<"$1" && grep -q sales <<<"$1" && grep -q "Schemas    : CREATE SCHEMA IF NOT EXISTS for: sales" <<<"$1"' _ "$OUT"
+run "${C[@]}" --from "$D" --exclude 'hr_*' --map-file "$T/map.txt" -n sales --create --yes
+check "--map-file + --exclude + -n sales creates the schema and restores its tables" bash -c '[[ $1 -eq 0 ]] && [[ $2 == "t|f" ]] && grep -q "Ensuring schema(s) exist (-n): sales" <<<"$3"' _ "$RC" "$(q "$PORT" t_n "SELECT (to_regclass('sales.orders') IS NOT NULL)::text || '|' || (to_regclass('public.regions') IS NOT NULL)::text" | sed 's/true/t/;s/false/f/;s/true/t/;s/false/f/')" "$OUT"
 
 # ----------------------------------------------------------------------------
 section "Many servers (--servers): one down, one with a database list"
 SV="$T/servers.txt"
 printf '# host,port,user,databases\n%s,%s,%s,all\n%s,%s,%s,all\n %s , %s , %s , srv_src \n' "$H" "$PORT" "$AR" "$H" "$DOWN" "$SU" "$H" "$PORT2" "$SU" >"$SV"
-SC=(--pgpassfile "$PGPASS" --min-free-mb 1 --pg-dump-wrapper "$PDW" -o "$T/srv" --no-owner)
+SC=(--pgpassfile "$PGPASS" --min-free-mb 1 --pg-dump-wrapper "$PDW" -o "$T/srv")
 run "${SC[@]}" --servers "$SV" --from "$D" --map 'src_*=srv_src' --map 'hr_*=srv_hr' --create --yes
 check "--servers with a down server -> exit 2" test "$RC" -eq 2
 check "down server: FAIL(2) precheck row" bash -c 'grep -qE "127\.0\.0\.1:$2 +FAIL\(2\) +precheck" <<<"$1"' _ "$OUT" "$DOWN"
 check "other servers restored; rows labelled host:port/db" bash -c 'grep -q "SERVER/DATABASE" <<<"$1" && grep -qE "127\.0\.0\.1:$2/srv_src +OK" <<<"$1" && grep -qE "127\.0\.0\.1:$2/srv_hr +OK" <<<"$1" && grep -qE "127\.0\.0\.1:$3/srv_src +OK" <<<"$1"' _ "$OUT" "$PORT" "$PORT2"
+OUT="$OUT" PORT="$PORT" DOWN="$DOWN" PORT2="$PORT2" check "summary rows follow servers-file order" python3 -c "
+import re,sys,os
+out,port,down,port2=os.environ['OUT'],os.environ['PORT'],os.environ['DOWN'],os.environ['PORT2']
+rows,on=[],False
+for line in out.splitlines():
+    if 'SERVER/DATABASE' in line and 'STATUS' in line:
+        on=True; continue
+    if not on: continue
+    if 'Run finished' in line: break
+    m=re.search(r'\[INFO\] +(\S+)', line)
+    if not m: break
+    rows.append(m.group(1))
+want=[f'127.0.0.1:{port}/srv_hr', f'127.0.0.1:{port}/srv_src', f'127.0.0.1:{down}', f'127.0.0.1:{port2}/srv_src']
+sys.exit(0 if rows==want else 1)
+"
 check "databases field limits what a server gets (no srv_hr on server 3)" bash -c '! grep -qE "127\.0\.0\.1:$2/srv_hr" <<<"$1" && [[ -z "$3" ]]' _ "$OUT" "$PORT2" "$(PGPASSFILE="$PGPASS" "$CLIENT_BIN/psql" -X -At -h "$H" -p "$PORT2" -U "$SU" -d postgres -c "SELECT 1 FROM pg_database WHERE datname='srv_hr'")"
 check "one log, lines tagged with the server" grep -q "\[127.0.0.1:$PORT2/srv_src\]" "$T/srv/pg_restore_wrapper.log"
-tty_run 'RESTORE 3\n' "${SC[@]}" --servers "$SV" --from "$D" --map 'src_*=srv_src' --map 'hr_*=srv_hr' --force
+tty_run 'RESTORE 3\n' "${SC[@]}" --servers "$SV" --from "$D" --map 'src_*=srv_src' --map 'hr_*=srv_hr' --clean --if-exists --force
 check "RESTORE 3 when only 2 servers can be restored -> cancelled" bash -c '[[ $1 -eq 2 ]] && grep -q "Type RESTORE 2 to continue" <<<"$2" && grep -q "Approval not given" <<<"$2"' _ "$RC" "$OUT"
 tty_run 'RESTORE 2\n' "${SC[@]}" --servers "$SV" --from "$D" --map 'src_*=srv_src' --map 'hr_*=srv_hr' --clean --if-exists --force
 check "RESTORE 2 accepted; --force overwrites; down server still FAIL" bash -c '[[ $1 -eq 2 ]] && grep -q "Approval accepted (RESTORE 2)" <<<"$2" && grep -q "NONE - --force" <<<"$2" && [[ $(grep -cE "/srv_(src|hr) +OK" <<<"$2") -eq 3 ]]' _ "$RC" "$OUT"
@@ -296,7 +325,35 @@ run "${SC[@]}" --servers "$SV" --from "$D" --map 'src_*=srv_src' -h "$H"
 check "-h with --servers -> exit 1" test "$RC" -eq 1
 
 # ----------------------------------------------------------------------------
-section "Alerts (webhook; e-mail needs a local mailer and is not tested)"
+
+# ----------------------------------------------------------------------------
+section "psql rollback handles incoming foreign keys"
+q "$PORT" postgres "CREATE DATABASE fksrc OWNER $AR" >/dev/null
+PGPASSFILE="$PGPASS" "$CLIENT_BIN/psql" -X -q -h "$H" -p "$PORT" -U "$AR" -d fksrc -v ON_ERROR_STOP=1 <<'SQL'
+CREATE TABLE public.parent(id int PRIMARY KEY, name text);
+CREATE TABLE public.child(id int PRIMARY KEY, parent_id int REFERENCES public.parent(id), note text);
+INSERT INTO public.parent VALUES (1,'a'),(2,'b');
+INSERT INTO public.child VALUES (1,1,'c1'),(2,2,'c2');
+SQL
+bash "$PDW" "${PDWC[@]}" -d fksrc -O -o "$T/fk" >/dev/null 2>&1
+FK_DUMP="$(printf '%s\n' "$T"/fk/fksrc_*.dump | head -n1)"
+run "${C[@]}" --from "$FK_DUMP" -d t_fk --create --yes
+check "FK source restored into t_fk" test "$RC" -eq 0
+run "${C[@]}" --from "$FK_DUMP" -d t_fk --clean --if-exists --backup-first=psql --yes
+check "psql backup of parent+child (internal FKs) succeeds" test "$RC" -eq 0
+RB="$(grep -oE "Rollback commands saved \(review, then run with bash\): .*" <<<"$OUT" | sed 's/.*: //')"
+check "internal-FK rollback uses one TRUNCATE of both tables" bash -c 'grep -q "Truncated together because of foreign keys" "$1" && grep -q "TRUNCATE " "$1" && ! grep -q "CASCADE" "$1"' _ "$RB"
+PGPASSFILE="$PGPASS" bash "$RB" >/dev/null 2>&1
+check "internal-FK rollback script runs" test "$?" -eq 0
+PGPASSFILE="$PGPASS" "$CLIENT_BIN/psql" -X -q -h "$H" -p "$PORT" -U "$AR" -d t_fk -c "CREATE TABLE public.audit(id int PRIMARY KEY, parent_id int REFERENCES public.parent(id), ev text); INSERT INTO public.audit VALUES (1,1,'e')" >/dev/null
+run "${C[@]}" --from "$FK_DUMP" -d t_fk -t parent --data-only --backup-first=psql --yes
+check "psql backup of only parent (external FKs) is taken before the data-only restore" bash -c 'grep -q "psql copy OK: public.parent_bkp_" <<<"$1"' _ "$OUT"
+RB="$(grep -oE "Rollback commands saved \(review, then run with bash\): .*" <<<"$OUT" | sed 's/.*: //')"
+check "external-FK rollback warns and recommends the dump method" bash -c 'grep -q "WARNING:" "$1" && grep -q "referenced by" "$1" && grep -q "Use --backup-first (dump)" "$1" && grep -q "TRUNCATE .* CASCADE" "$1"' _ "$RB"
+check "external-FK rollback is commented, not a runnable TRUNCATE" bash -c '! grep -v "^#" "$1" | grep -q TRUNCATE' _ "$RB"
+
+# ----------------------------------------------------------------------------
+section "Alerts (webhook and e-mail via a fake mailer on PATH)"
 HOOK_PORT=$((PORT + 3)); HOOK_LOG="$T/hook.log"
 python3 - "$HOOK_PORT" "$HOOK_LOG" >/dev/null 2>&1 <<'PY' &
 import http.server, sys
@@ -313,6 +370,36 @@ run --from "$D" --alert-webhook "http://127.0.0.1:$HOOK_PORT/hook" --alert-webho
 check "--alert-test posts a TEST webhook" bash -c '[[ $1 -eq 0 ]] && grep -q "\"status\":\"TEST\"" "$2"' _ "$RC" "$HOOK_LOG"
 run "${C[@]}" --from "$D" --map 'src_*=t_src' --map 'hr_*=t_hr' --alert-webhook "http://127.0.0.1:$HOOK_PORT/hook" --alert-webhook-format json
 check "refused run sends a FAILED webhook with the stage" bash -c 'grep -q "\"status\":\"FAILED\"" "$1" && grep -q "\"failed_stage\":\"precheck\"" "$1"' _ "$HOOK_LOG"
+
+# Fake mail(1) on PATH (preferred mailer). Records argv + body.
+mkdir -p "$T/fakemail"
+FAKE_MAIL_LOG="$T/fakemail/log"
+: >"$FAKE_MAIL_LOG"
+printf '%s\n' '#!/usr/bin/env bash' 'log=${FAKE_MAIL_LOG:?}' '{' '  printf "ARGV:"' '  for a in "$@"; do printf " %q" "$a"; done' '  printf "\n"' '  cat' '  printf "\n"' '} >>"$log"' 'exit 0' >"$T/fakemail/mail"
+chmod +x "$T/fakemail/mail"
+PATH="$T/fakemail:$PATH" FAKE_MAIL_LOG="$FAKE_MAIL_LOG" run --from "$D" --alert-email dba@example.com --alert-from pg-restore@example.com --alert-test -o "$T/alert-mail"
+check "--alert-test sends e-mail via mail on PATH" bash -c '[[ $1 -eq 0 ]] && grep -q "Alert: e-mail sent to dba@example.com" <<<"$2" && grep -q " -s " "$3" && grep -q "dba@example.com" "$3" && grep -q "pg_restore_wrapper TEST" "$3"' _ "$RC" "$OUT" "$FAKE_MAIL_LOG"
+: >"$FAKE_MAIL_LOG"
+PATH="$T/fakemail:$PATH" FAKE_MAIL_LOG="$FAKE_MAIL_LOG" run "${C[@]}" --from "$D" --map 'src_*=t_src' --map 'hr_*=t_hr' --alert-email dba@example.com --alert-from pg-restore@example.com
+check "refused run sends a FAILED e-mail" bash -c 'grep -q "Alert: e-mail sent to dba@example.com" <<<"$1" && grep -q "FAILED" "$2" && grep -q "Failed at  : precheck" "$2"' _ "$OUT" "$FAKE_MAIL_LOG"
+
+# Fake sendmail only: hide any real mail/mailx so the wrapper picks sendmail.
+mkdir -p "$T/fakesend"
+FAKE_SM_LOG="$T/fakesend/log"
+: >"$FAKE_SM_LOG"
+printf '%s\n' '#!/usr/bin/env bash' 'log=${FAKE_MAIL_LOG:?}' 'cat >>"$log"' 'exit 0' >"$T/fakesend/sendmail"
+chmod +x "$T/fakesend/sendmail"
+SMPATH="$T/fakesend"
+IFS=:
+for d in $PATH; do
+    [[ -x "$d/mail" || -x "$d/mailx" || -x "$d/sendmail" ]] && continue
+    SMPATH+=":$d"
+done
+unset IFS
+: >"$FAKE_SM_LOG"
+PATH="$SMPATH" FAKE_MAIL_LOG="$FAKE_SM_LOG" run --from "$D" --alert-email oncall@example.com --alert-test -o "$T/alert-sm"
+check "--alert-test sends e-mail via sendmail on PATH" bash -c '[[ $1 -eq 0 ]] && grep -q "Alert: e-mail sent to oncall@example.com" <<<"$2" && grep -q "To: oncall@example.com" "$3" && grep -q "Subject: \[pg_restore_wrapper\] TEST" "$3"' _ "$RC" "$OUT" "$FAKE_SM_LOG"
+
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
