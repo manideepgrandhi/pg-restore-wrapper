@@ -33,12 +33,13 @@ jobs=4                             # custom / directory dumps only (ignored for 
 clean=yes
 if_exists=yes
 create=yes                         # CREATE DATABASE only when it does not exist yet
-no_owner=yes                       # Aurora/RDS: the login usually cannot become the dump's owners
+no_owner=yes                       # default; skip ownership commands (Aurora/RDS-safe)
+# keep_owner=no                    # yes = restore the dump's owners (--keep-owner). Usually fails on Aurora/RDS.
 no_privileges=yes
 # role=app_owner                   # SET ROLE before restoring
 # schema_only=no
 # data_only=no
-# schemas=sales                    # pg_restore -n: the schema must already exist in the target
+# schemas=sales                    # pg_restore -n; the wrapper runs CREATE SCHEMA IF NOT EXISTS first
 # tables=sales.orders
 # exit_on_error=no
 checksum=yes                       # verify <dump>.sha256 when present

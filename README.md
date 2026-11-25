@@ -41,7 +41,7 @@ These are tables in the dump that already exist in the target database (from `pg
 
 The wrapper does not count rows or compare sizes. Choose the method yourself: `psql` copies are quick for small tables and need space in the same database, while `dump` suits big tables.
 
-**If tables exist and `--clean` is not set**, the wrapper warns you. pg_restore would hit "already exists" / duplicate-key errors (`FAIL(3)`) and could add rows to the old data. For a full replace use `--clean --if-exists`.
+**If tables exist and `--clean` is not set**, the run **refuses with exit 2** and nothing is restored (the backup prompt is not shown either). Use `--clean --if-exists` for a full replace, or `--data-only` to reload data only (the existing-table backup rules still apply).
 
 ## Options
 
@@ -78,8 +78,10 @@ Each line is `host,port,user,databases`. `databases` is `all` or a comma list of
 | `-c, --clean` / `--if-exists` | Drop objects before recreating them / use `DROP ... IF EXISTS`. |
 | `-C, --create` | Create the target database **only if it does not exist** (plain `CREATE DATABASE` from the maintenance db, after `SET ROLE` when `--role` is given). Without it, a missing database is `FAIL(2)`. |
 | `-s, --schema-only` / `-a, --data-only` | Definitions only / data only. |
-| `-n, --schema` / `-t, --table` | Restore only these schemas/tables (repeatable). Note: `pg_restore -n` restores the objects **in** the schema, not the `CREATE SCHEMA` itself, so the schema must already exist in the target. |
-| `-O, --no-owner` / `-x, --no-privileges` | Skip ownership / GRANT-REVOKE. **On Aurora/RDS you almost always want `-O`**: the master user is not a superuser and cannot become the dump's owner roles. If a restore fails with `must be able to SET ROLE`, the wrapper prints that hint. |
+| `-n, --schema` / `-t, --table` | Restore only these schemas/tables (repeatable). For `-n`, the wrapper runs `CREATE SCHEMA IF NOT EXISTS` for each schema actually present in the dump (shown in the RESTORE SUMMARY and in `--dry-run`), so the schema does not have to exist already. `pg_restore -n` itself still does not emit `CREATE SCHEMA`. |
+| `-O, --no-owner` | Skip ownership commands. **This is the default**, because on Aurora/RDS the master user is not a superuser and cannot become the dump's owner roles. |
+| `--keep-owner` | Restore the dump's ownership commands (opt out of the default). If that fails with `must be able to SET ROLE`, the wrapper prints a hint to drop `--keep-owner` or use `--role`. Config: `keep_owner=yes` or `no_owner=no`. |
+| `-x, --no-privileges` | Skip GRANT/REVOKE. |
 | `--role ROLE` | `SET ROLE` before restoring (also for psql backups and `CREATE DATABASE`). |
 | `-e, --exit-on-error` | Stop pg_restore at its first error. By default pg_restore continues, and the file is still `FAIL(3)` if any error happened. |
 | `--no-checksum` | Do not verify `.sha256` files. |
@@ -121,7 +123,7 @@ Each line is `host,port,user,databases`. `databases` is `all` or a comma list of
 2026-11-25 04:50:14 [ERROR] Run finished with exit code 3 (stage: restore (salesdb))
 ```
 
-With `--servers`, the rows are `host:port/db`. A full set of real runs is in [EXAMPLES.md](EXAMPLES.md).
+With `--servers`, the rows are `host:port/db`, in servers-file order. A full set of real runs is in [EXAMPLES.md](EXAMPLES.md).
 
 ## Exit codes
 
@@ -140,7 +142,7 @@ Runs with several files or servers exit with the highest code of any row.
 ## Known limits
 
 - `--backup-first=psql` copies and rollbacks list the columns explicitly and leave out generated columns (PostgreSQL recomputes them), so tables with `GENERATED ALWAYS AS (...) STORED` columns work.
-- The psql rollback (`TRUNCATE` + `INSERT`) fails if other tables reference the table by foreign key. Use the dump method, or edit the rollback file (note that `TRUNCATE ... CASCADE` also empties the referencing tables).
+- The psql rollback will not run a bare `TRUNCATE` on a table that other tables (not in the backup) still reference. It warns, recommends the dump method, and comments a `TRUNCATE ... CASCADE` alternative that would also empty those referencing tables.
 - Restores run one file after another. `-j` gives parallelism inside one restore.
 - Tested on Linux with PostgreSQL 17 (see `tests/`). Windows Git Bash paths are handled the same way as in pg_dump_wrapper but have not been tested here.
 

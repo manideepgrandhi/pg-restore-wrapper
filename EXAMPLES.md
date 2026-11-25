@@ -23,7 +23,7 @@ A directory-format dump works the same way:
 pg_restore_wrapper.sh --from /backups/hrdb_20261124_010018.dir -d hrdb -h db2.example.internal --create -j 8
 ```
 
-Only one schema or table (the schema must already exist in the target, because `pg_restore -n` does not restore `CREATE SCHEMA`):
+Only one schema or table. For `-n`, the wrapper runs `CREATE SCHEMA IF NOT EXISTS` first (pg_restore itself does not):
 ```bash
 pg_restore_wrapper.sh --from /backups/salesdb_20261124_010015.dump -d salesdb -h db2.example.internal \
   -n sales --clean --if-exists --backup-first
@@ -82,6 +82,7 @@ pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432 \
 ## Existing tables
 
 Tables in the dump that already exist in the target are never overwritten silently.
+If any exist and `--clean` is not set, the run refuses with exit 2 (unless you pass `--data-only`). Use `--clean --if-exists` for a full replace.
 
 ```bash
 # back them up with pg_dump_wrapper.sh (default method) after approval
@@ -110,12 +111,12 @@ If any backup fails, no restore starts (exit 5).
 
 ## Aurora / RDS
 
-The master user is not a superuser, so it cannot set object owners to other roles. Use `-O` (and usually `-x`):
+The master user is not a superuser, so it cannot set object owners to other roles. `--no-owner` is the default (and you usually also want `-x`):
 ```bash
 pg_restore_wrapper.sh --from salesdb.dump -d salesdb -h mycluster.cluster-abc123.ap-south-1.rds.amazonaws.com \
-  -U dba_admin --pgpassfile ~/.pgpass --create --clean --if-exists --no-owner --no-privileges --backup-first
+  -U dba_admin --pgpassfile ~/.pgpass --create --clean --if-exists --no-privileges --backup-first
 ```
-If you forget `-O`, the restore fails with `must be able to SET ROLE "postgres"`, and the wrapper prints a hint to re-run with `--no-owner` or `--role`.
+`--keep-owner` turns the default off. That usually fails with `must be able to SET ROLE "postgres"`, and the wrapper prints a hint to drop `--keep-owner` or use `--role`.
 
 Restore as the application owner so the new objects belong to it:
 ```bash
@@ -179,7 +180,7 @@ Every run with a backup prints rollback commands at the end and saves them as a 
 [INFO] Rollback commands saved (review, then run with bash): /backups/restore-work/rollback_20261125_013012.sh
 ```
 - dump method: a `pg_restore_wrapper.sh --from <backup file> -d DB --clean --if-exists --force` command. It asks for approval again.
-- psql method: `TRUNCATE` + `INSERT ... SELECT` from the `_bkp_` copy in one transaction, plus a commented `DROP TABLE` for later.
+- psql method: `TRUNCATE` + `INSERT ... SELECT` from the `_bkp_` copy in one transaction, plus a commented `DROP TABLE` for later. If other tables in the same backup reference a copied table, they are truncated together. If a table outside the backup references it, the script warns, recommends the dump method, and only comments a `TRUNCATE ... CASCADE` alternative (that would also empty those referencing tables).
 
 Read the file, then run it with `bash /backups/restore-work/rollback_20261125_013012.sh`.
 
@@ -200,6 +201,8 @@ esac
 ## Real output
 
 The runs below are real (PostgreSQL 17, non-superuser login) with fake host names and paths substituted afterwards.
+
+Note: sections 5 and 5c were captured when a missing `--clean` only warned and then let pg_restore fail. The wrapper now **refuses with exit 2** in that situation (unless `--data-only` is set), so you will not see a restore start without `--clean`. `--no-owner` is also the default now, even if you omit it from the command line.
 
 ```text
 ------------------------------------------------------------------------------

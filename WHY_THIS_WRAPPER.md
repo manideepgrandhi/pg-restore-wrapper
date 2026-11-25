@@ -8,7 +8,7 @@
 |---|---|---|
 | Shows what will happen first | no | RESTORE SUMMARY: target, files → databases, options, checksums, backup plan |
 | Stops a restore into the wrong server | no | type the exact host name (or `RESTORE N` for many servers); cron needs `--yes` |
-| Existing tables | overwritten (with `--clean`) or errors | listed; backup first (pg_dump_wrapper or psql copy), `OVERWRITE N`, or cancel; cron refuses without `--backup-first`/`--force` |
+| Existing tables | overwritten (with `--clean`) or errors | listed; backup first (pg_dump_wrapper or psql copy), `OVERWRITE N`, or cancel; refuses without `--clean` (unless `--data-only`); cron also needs `--backup-first`/`--force` |
 | Undo | your problem | rollback commands printed and saved as a script |
 | Folder of dumps | one command per file | one run; newest dump per database; explicit `--map` |
 | Checksums | no | verifies `.sha256` from pg_dump_wrapper |
@@ -16,7 +16,7 @@
 | Plain `.sql` / `.sql.gz` | a different tool (`psql`) and flags | the same command; `-O`/`-x` work for plain dumps too |
 | Many servers | a loop you write | `--servers`, one summary and one alert |
 | Result | read the output | summary table, one log, exit codes by stage, e-mail/webhook alerts |
-| Aurora/RDS | fails on `OWNER TO` with no explanation | hint to use `--no-owner` / `--role`; no superuser-only commands |
+| Aurora/RDS | fails on `OWNER TO` with no explanation | `--no-owner` is the default; a hint if `--keep-owner` fails; no superuser-only commands |
 
 ## Before and after
 
