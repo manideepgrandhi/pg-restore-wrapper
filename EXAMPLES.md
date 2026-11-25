@@ -1,513 +1,503 @@
-# pg_restore_wrapper.sh examples
+# pg_restore_wrapper.sh: usage examples (v1.0.0)
 
-Copy-paste recipes. Host names, paths and data are examples. Every command below asks for approval (type the host name) unless it has `--yes`. Add `--dry-run` first to see the plan and the exact commands without changing anything.
+These are copy-paste recipes for `pg_restore_wrapper.sh`. Each example has
+**when to use it**, **the command**, and **sample output** from a real run
+(PostgreSQL 17, non-superuser login). Hosts, users, paths and alert targets
+below are placeholders (`db1.example.internal`, `dba_admin`, `dba@example.com`,
+`hooks.slack.com/services/XXX`). Replace them with your own values.
 
-Contents: [Basics](#basics) · [Folders and mapping](#folders-and-mapping) · [Existing tables](#existing-tables) · [Aurora / RDS](#aurora--rds) · [Plain SQL dumps](#plain-sql-dumps) · [Many servers](#many-servers) · [Config file and cron](#config-file-and-cron) · [Alerts](#alerts) · [Backup locations](#backup-locations) · [Exit codes in scripts](#exit-codes-in-scripts) · [Real output](#real-output)
+For the full option reference, see [README.md](README.md).
 
-## Basics
+Put the password in `~/.pgpass` or pass `--pgpassfile`. Every restore asks
+for approval (type the target host name, or `RESTORE N` with `--servers`)
+unless you pass `--yes`. `--no-owner` is the default (needed on Aurora/RDS);
+use `--keep-owner` to opt out. `--from` is a file or a folder; nothing is
+guessed from file names.
 
-Restore one dump into an existing database and replace its objects:
+## Contents
+1. [Restore a single dump file](#1-restore-a-single-dump-file)
+2. [Dry run](#2-dry-run)
+3. [Restore a backup folder with a map file](#3-restore-a-backup-folder-with-a-map-file)
+4. [Back up first with dump (default)](#4-back-up-first-with-dump-default)
+5. [Back up first with psql](#5-back-up-first-with-psql)
+6. [The existing-table prompt](#6-the-existing-table-prompt)
+7. [One schema or table (or schema-only / data-only)](#7-one-schema-or-table-or-schema-only--data-only)
+8. [Many servers with `--servers`](#8-many-servers-with---servers)
+9. [Test e-mail and webhook alerts](#9-test-e-mail-and-webhook-alerts)
+10. [Backup failed (exit 5)](#10-backup-failed-exit-5)
+11. [Exit codes](#11-exit-codes)
+
+---
+
+## 1. Restore a single dump file
+**When:** you have one dump and want it applied to one database. `--create` makes the database if it does not exist yet.
 ```bash
-pg_restore_wrapper.sh --from /backups/salesdb_20261124_010015.dump -d salesdb \
-  -h db2.example.internal -U dba_admin --clean --if-exists --backup-first
+./pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump \
+  -d salesdb -h db2.example.internal -U dba_admin --create --yes -o /backups/restore-work
+```
+**Sample output:**
+```
+2026-11-25 10:12:10 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
+2026-11-25 10:12:10 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
+2026-11-25 10:12:10 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
+2026-11-25 10:12:10 [INFO] File map (1):
+2026-11-25 10:12:10 [INFO]   salesdb_20261125_101209.dump -> salesdb  (8.0K, custom)
+2026-11-25 10:12:10 [INFO] Checksum OK: salesdb_20261125_101209.dump
+2026-11-25 10:12:10 [INFO] Connected: server_version_num=170012
+
+RESTORE SUMMARY
+  Target     : db2.example.internal:5432  user=dba_admin
+  Source     : /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump  (1 file(s), 8.0K)
+  Files      : salesdb_20261125_101209.dump -> salesdb  (new, will be created)
+  Options    : --create --no-owner
+  Checksums  : 1 OK
+  Backup     : none needed (no existing tables will be overwritten)
+
+2026-11-25 10:12:10 [INFO] Approval skipped (--yes)
+2026-11-25 10:12:10 [INFO] [salesdb] Creating database salesdb (--create; it does not exist)
+2026-11-25 10:12:10 [INFO] [salesdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:10 [INFO] [salesdb] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password --no-owner /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:10 [INFO] [salesdb] Restore finished in 0m00s
+2026-11-25 10:12:10 [INFO] Summary:
+2026-11-25 10:12:10 [INFO]   DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
+2026-11-25 10:12:10 [INFO]   salesdb                  OK        -          8.0K     0m00s    /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:10 [INFO] Run finished OK in 0m00s
 ```
 
-Restore into a new database (created only if it does not exist yet), 4 parallel jobs:
+A directory-format dump works the same way: pass the `.dir` folder as `--from`.
+
+---
+
+## 2. Dry run
+**When:** you want to see the plan, the file map and the exact commands without changing anything (no backup, no restore, no alert).
 ```bash
-pg_restore_wrapper.sh --from /backups/salesdb_20261124_010015.dump -d salesdb_copy \
-  -h db2.example.internal -U dba_admin --create -j 4
+./pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432 \
+  --map 'salesdb_*=salesdb' --map 'hrdb_*=hrdb' \
+  -h db2.example.internal -U dba_admin --create --clean --if-exists -j 4 --dry-run \
+  -o /backups/restore-work
+```
+**Sample output:**
+```
+2026-11-25 10:12:10 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
+2026-11-25 10:12:10 [INFO] DRY RUN - nothing will be created, backed up or restored
+2026-11-25 10:12:10 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
+2026-11-25 10:12:10 [INFO] Source /backups/postgres/db1.example.internal_5432: 2 dump file(s) selected, 1 older file(s) skipped
+2026-11-25 10:12:10 [INFO] Skipping older dump (a newer file of the same dump is selected): /backups/postgres/db1.example.internal_5432/salesdb_20261117_010002.dump
+2026-11-25 10:12:10 [INFO] File map (2):
+2026-11-25 10:12:10 [INFO]   hrdb_20261125_101209.dir     -> hrdb  (12K, directory)
+2026-11-25 10:12:10 [INFO]   salesdb_20261125_101209.dump -> salesdb  (8.0K, custom)
+2026-11-25 10:12:10 [INFO] Checksum OK: hrdb_20261125_101209.dir
+2026-11-25 10:12:10 [INFO] Checksum OK: salesdb_20261125_101209.dump
+2026-11-25 10:12:10 [INFO] Connected: server_version_num=170012
+2026-11-25 10:12:11 [WARN] 3 existing table(s) would be overwritten by this restore:
+2026-11-25 10:12:11 [WARN]   db2.example.internal:5432/salesdb: public.regions, sales.customers, sales.orders
+2026-11-25 10:12:11 [INFO] DRY RUN - would ask: back them up first? [dump / psql / skip / cancel]
+
+RESTORE SUMMARY
+  Target     : db2.example.internal:5432  user=dba_admin
+  Source     : /backups/postgres/db1.example.internal_5432  (2 file(s), 20K; 1 older file(s) skipped)
+  Files      : hrdb_20261125_101209.dir     -> hrdb  (new, will be created)
+               salesdb_20261125_101209.dump -> salesdb  (exists, 3 table(s) will be overwritten)
+  Options    : --clean --if-exists --create -j 4 --no-owner
+  Checksums  : 2 OK
+  Backup     : 3 table(s) via pg_dump_wrapper.sh -> /backups/restore-work/pre_restore_backups/
+
+2026-11-25 10:12:11 [INFO] DRY RUN - pre-restore backup (dump) would run:
+bash /opt/pg-tools/pg_dump_wrapper.sh -h db2.example.internal -p 5432 -U dba_admin -d salesdb -F custom --checksum --table-sizes 0 --min-free-mb 1024 -o /backups/restore-work/pre_restore_backups/db2.example.internal_5432 --pgpassfile /home/dba/.pgpass -t \"public\".\"regions\" -t \"sales\".\"customers\" -t \"sales\".\"orders\"
+2026-11-25 10:12:11 [INFO] DRY RUN - restore commands:
+psql -X -w -q -v ON_ERROR_STOP=1 -h db2.example.internal -p 5432 -U dba_admin -d postgres -c CREATE\ DATABASE\ \"hrdb\"
+pg_restore -h db2.example.internal -p 5432 -U dba_admin -d hrdb --no-password --jobs=4 --clean --if-exists --no-owner /backups/postgres/db1.example.internal_5432/hrdb_20261125_101209.dir
+pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password --jobs=4 --clean --if-exists --no-owner /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:11 [INFO] DRY RUN - approval would be required: type db2.example.internal
 ```
 
-A directory-format dump works the same way:
+---
+
+## 3. Restore a backup folder with a map file
+**When:** a dump-wrapper folder holds several databases and more than one date. Map each file (or glob) to a target database; the newest file of each dump is used, and older ones are skipped. `--exclude` drops a dump you do not want; `--include` can pin an older file.
 ```bash
-pg_restore_wrapper.sh --from /backups/hrdb_20261124_010018.dir -d hrdb -h db2.example.internal --create -j 8
+# /etc/pg_restore/map.txt
+# FILE=DB  (name or shell glob; first match wins)
+salesdb_*=salesdb_uat
+hrdb_*=hrdb_uat
+```
+```bash
+./pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432 \
+  --map-file /etc/pg_restore/map.txt --exclude 'hrdb_*' \
+  -h db2.example.internal -U dba_admin --create --yes -o /backups/restore-work
+```
+**Sample output:**
+```
+2026-11-25 10:12:11 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
+2026-11-25 10:12:11 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
+2026-11-25 10:12:11 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
+2026-11-25 10:12:11 [INFO] Excluded by --exclude: hrdb_20261125_101209.dir
+2026-11-25 10:12:11 [INFO] Source /backups/postgres/db1.example.internal_5432: 1 dump file(s) selected, 1 older file(s) skipped
+2026-11-25 10:12:11 [INFO] Skipping older dump (a newer file of the same dump is selected): /backups/postgres/db1.example.internal_5432/salesdb_20261117_010002.dump
+2026-11-25 10:12:11 [INFO] File map (1):
+2026-11-25 10:12:11 [INFO]   salesdb_20261125_101209.dump -> salesdb_uat  (8.0K, custom)
+2026-11-25 10:12:11 [INFO] Checksum OK: salesdb_20261125_101209.dump
+2026-11-25 10:12:11 [INFO] Connected: server_version_num=170012
+
+RESTORE SUMMARY
+  Target     : db2.example.internal:5432  user=dba_admin
+  Source     : /backups/postgres/db1.example.internal_5432  (1 file(s), 8.0K; 1 older file(s) skipped)
+  Files      : salesdb_20261125_101209.dump -> salesdb_uat  (new, will be created)
+  Options    : --create --no-owner
+  Checksums  : 1 OK
+  Backup     : none needed (no existing tables will be overwritten)
+
+2026-11-25 10:12:11 [INFO] Approval skipped (--yes)
+2026-11-25 10:12:11 [INFO] [salesdb_uat] Creating database salesdb_uat (--create; it does not exist)
+2026-11-25 10:12:11 [INFO] [salesdb_uat] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:11 [INFO] [salesdb_uat] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb_uat --no-password --no-owner /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:11 [INFO] [salesdb_uat] Restore finished in 0m00s
+2026-11-25 10:12:11 [INFO] Summary:
+2026-11-25 10:12:11 [INFO]   DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
+2026-11-25 10:12:11 [INFO]   salesdb_uat              OK        -          8.0K     0m00s    /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:11 [INFO] Run finished OK in 0m00s
 ```
 
-Only one schema or table. For `-n`, the wrapper runs `CREATE SCHEMA IF NOT EXISTS` first (pg_restore itself does not):
+To restore an older dump instead of the newest, pin it with `--include`:
 ```bash
-pg_restore_wrapper.sh --from /backups/salesdb_20261124_010015.dump -d salesdb -h db2.example.internal \
-  -n sales --clean --if-exists --backup-first
-pg_restore_wrapper.sh --from /backups/salesdb_20261124_010015.dump -d salesdb -h db2.example.internal \
-  -t orders -t customers --clean --if-exists --backup-first=psql
+./pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432 \
+  --include 'salesdb_20261117_*' --map 'salesdb_*=salesdb' \
+  -h db2.example.internal -U dba_admin --create --yes -o /backups/restore-work
+```
+
+---
+
+## 4. Back up first with dump (default)
+**When:** the target already has tables and you want a `pg_dump` copy of them before the restore. `--backup-first` (or `--backup-first=dump`) runs `pg_dump_wrapper.sh`, then restores. Copies are kept for manual recovery; the wrapper does not roll anything back.
+```bash
+./pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump \
+  -d salesdb -h db2.example.internal -U dba_admin --clean --if-exists --backup-first --yes \
+  -o /backups/restore-work
+```
+**Sample output:**
+```
+2026-11-25 10:12:11 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
+2026-11-25 10:12:11 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
+2026-11-25 10:12:11 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
+2026-11-25 10:12:11 [INFO] File map (1):
+2026-11-25 10:12:11 [INFO]   salesdb_20261125_101209.dump -> salesdb  (8.0K, custom)
+2026-11-25 10:12:11 [INFO] Checksum OK: salesdb_20261125_101209.dump
+2026-11-25 10:12:11 [INFO] Connected: server_version_num=170012
+
+RESTORE SUMMARY
+  Target     : db2.example.internal:5432  user=dba_admin
+  Source     : /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump  (1 file(s), 8.0K)
+  Files      : salesdb_20261125_101209.dump -> salesdb  (exists, 3 table(s) will be overwritten)
+  Options    : --clean --if-exists --no-owner
+  Checksums  : 1 OK
+  Backup     : 3 table(s) via pg_dump_wrapper.sh -> /backups/restore-work/pre_restore_backups/
+
+2026-11-25 10:12:11 [INFO] Approval skipped (--yes)
+2026-11-25 10:12:11 [INFO] Starting pre-restore backups (dump): 3 table(s)
+2026-11-25 10:12:11 [INFO] [salesdb] Backing up public.regions, sales.customers, sales.orders with pg_dump_wrapper.sh
+2026-11-25 10:12:11 [INFO] [salesdb] Command: bash /opt/pg-tools/pg_dump_wrapper.sh -h db2.example.internal -p 5432 -U dba_admin -d salesdb -F custom --checksum --table-sizes 0 --min-free-mb 1024 -o /backups/restore-work/pre_restore_backups/db2.example.internal_5432 --pgpassfile /home/dba/.pgpass -t \"public\".\"regions\" -t \"sales\".\"customers\" -t \"sales\".\"orders\"
+2026-11-25 10:12:12 [INFO] [salesdb] pg_dump_wrapper.sh OK: /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_101211.dump (8.0K, 0m01s)
+2026-11-25 10:12:12 [INFO] Pre-restore backups finished OK (dump)
+2026-11-25 10:12:12 [INFO] [salesdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:12 [INFO] [salesdb] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password --clean --if-exists --no-owner /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:12 [INFO] [salesdb] Restore finished in 0m00s
+2026-11-25 10:12:12 [INFO] Pre-restore backups saved:
+  [dump] db2.example.internal:5432/salesdb  /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_101211.dump
+2026-11-25 10:12:12 [INFO] Summary:
+2026-11-25 10:12:12 [INFO]   DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
+2026-11-25 10:12:12 [INFO]   salesdb                  OK        -          8.0K     0m00s    /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:12 [INFO] Run finished OK in 0m01s
+```
+
+---
+
+## 5. Back up first with psql
+**When:** you want a quick in-database copy instead of a dump file. Each table is copied to `<backup-schema>.<table>_bkp_<YYYYMMDD_HHMM>` (`public` by default; `_2`, `_3` on a name collision).
+```bash
+./pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump \
+  -d salesdb -h db2.example.internal -U dba_admin --clean --if-exists --backup-first=psql --yes \
+  -o /backups/restore-work
+```
+**Sample output:**
+```
+2026-11-25 10:12:12 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
+2026-11-25 10:12:12 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
+2026-11-25 10:12:12 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
+2026-11-25 10:12:12 [INFO] File map (1):
+2026-11-25 10:12:12 [INFO]   salesdb_20261125_101209.dump -> salesdb  (8.0K, custom)
+2026-11-25 10:12:12 [INFO] Checksum OK: salesdb_20261125_101209.dump
+2026-11-25 10:12:12 [INFO] Connected: server_version_num=170012
+
+RESTORE SUMMARY
+  Target     : db2.example.internal:5432  user=dba_admin
+  Source     : /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump  (1 file(s), 8.0K)
+  Files      : salesdb_20261125_101209.dump -> salesdb  (exists, 3 table(s) will be overwritten)
+  Options    : --clean --if-exists --no-owner
+  Checksums  : 1 OK
+  Backup     : 3 table(s) psql copy -> public.<table>_bkp_20261125_1012
+
+2026-11-25 10:12:12 [INFO] Approval skipped (--yes)
+2026-11-25 10:12:12 [INFO] Starting pre-restore backups (psql): 3 table(s)
+2026-11-25 10:12:12 [INFO] [salesdb] Backing up public.regions with psql -> public.regions_bkp_20261125_1012
+2026-11-25 10:12:12 [INFO] [salesdb] psql copy OK: public.regions_bkp_20261125_1012 (6 rows)
+2026-11-25 10:12:12 [INFO] [salesdb] Backing up sales.customers with psql -> public.customers_bkp_20261125_1012
+2026-11-25 10:12:12 [INFO] [salesdb] psql copy OK: public.customers_bkp_20261125_1012 (40 rows)
+2026-11-25 10:12:12 [INFO] [salesdb] Backing up sales.orders with psql -> public.orders_bkp_20261125_1012
+2026-11-25 10:12:12 [INFO] [salesdb] psql copy OK: public.orders_bkp_20261125_1012 (500 rows)
+2026-11-25 10:12:12 [INFO] Pre-restore backups finished OK (psql)
+2026-11-25 10:12:12 [INFO] [salesdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:12 [INFO] [salesdb] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password --clean --if-exists --no-owner /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:12 [INFO] [salesdb] Restore finished in 0m00s
+2026-11-25 10:12:12 [INFO] Pre-restore backups saved:
+  [psql] db2.example.internal:5432/salesdb  public.regions_bkp_20261125_1012  (copy of public.regions, 6 rows)
+  [psql] db2.example.internal:5432/salesdb  public.customers_bkp_20261125_1012  (copy of sales.customers, 40 rows)
+  [psql] db2.example.internal:5432/salesdb  public.orders_bkp_20261125_1012  (copy of sales.orders, 500 rows)
+2026-11-25 10:12:12 [INFO] Summary:
+2026-11-25 10:12:12 [INFO]   DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
+2026-11-25 10:12:12 [INFO]   salesdb                  OK        -          8.0K     0m00s    /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:12 [INFO] Run finished OK in 0m00s
+```
+
+---
+
+## 6. The existing-table prompt
+**When:** you run from a terminal, the target already has tables, and you did not pass `--backup-first` or `--force`. The wrapper asks `dump` / `psql` / `skip` / `cancel`, then asks you to type the target host name. This sample answers `dump` and then the host. `psql` takes in-database copies instead; `skip` requires typing `OVERWRITE N` (N is the table count) to restore with no backup; `cancel` stops the run. Unattended jobs (no terminal) are refused unless you pass `--backup-first`, `--force`, or `--yes` with a backup option.
+```bash
+./pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump \
+  -d salesdb -h db2.example.internal -U dba_admin --clean --if-exists \
+  -o /backups/restore-work
+```
+**Sample output:**
+```
+2026-11-25 11:11:27 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
+2026-11-25 11:11:27 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
+2026-11-25 11:11:27 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
+2026-11-25 11:11:27 [INFO] File map (1):
+2026-11-25 11:11:27 [INFO]   salesdb_20261125_101209.dump -> salesdb  (8.0K, custom)
+2026-11-25 11:11:27 [INFO] Checksum OK: salesdb_20261125_101209.dump
+2026-11-25 11:11:27 [INFO] Connected: server_version_num=170012
+2026-11-25 11:11:27 [WARN] 3 existing table(s) would be overwritten by this restore:
+2026-11-25 11:11:27 [WARN]   db2.example.internal:5432/salesdb: public.regions, sales.customers, sales.orders
+Back them up first? [dump / psql / skip / cancel]: 
+2026-11-25 11:11:27 [INFO] Answer: dump
+2026-11-25 11:11:27 [INFO] Starting pre-restore backups (dump): 3 table(s)
+2026-11-25 11:11:27 [INFO] [salesdb] Backing up public.regions, sales.customers, sales.orders with pg_dump_wrapper.sh
+2026-11-25 11:11:27 [INFO] [salesdb] Command: bash /opt/pg-tools/pg_dump_wrapper.sh -h db2.example.internal -p 5432 -U dba_admin -d salesdb -F custom --checksum --table-sizes 0 --min-free-mb 1024 -o /backups/restore-work/pre_restore_backups/db2.example.internal_5432 --pgpassfile /home/dba/.pgpass -t \"public\".\"regions\" -t \"sales\".\"customers\" -t \"sales\".\"orders\"
+2026-11-25 11:11:27 [INFO] [salesdb] pg_dump_wrapper.sh OK: /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_111127.dump (8.0K, 0m00s)
+2026-11-25 11:11:27 [INFO] Pre-restore backups finished OK (dump)
+
+RESTORE SUMMARY
+  Target     : db2.example.internal:5432  user=dba_admin
+  Source     : /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump  (1 file(s), 8.0K)
+  Files      : salesdb_20261125_101209.dump -> salesdb  (exists, 3 table(s) will be overwritten)
+  Options    : --clean --if-exists --no-owner
+  Checksums  : 1 OK
+  Backup     : 3 table(s) already backed up (dump); locations are printed at the end
+
+Type the target host name to continue (db2.example.internal), anything else cancels: 
+2026-11-25 11:11:27 [INFO] Answer: db2.example.internal
+2026-11-25 11:11:27 [INFO] Approval accepted (db2.example.internal)
+2026-11-25 11:11:27 [INFO] [salesdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 11:11:27 [INFO] [salesdb] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password --clean --if-exists --no-owner /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 11:11:27 [INFO] [salesdb] Restore finished in 0m00s
+2026-11-25 11:11:27 [INFO] Pre-restore backups saved:
+  [dump] db2.example.internal:5432/salesdb  /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_111127.dump
+2026-11-25 11:11:27 [INFO] Summary:
+2026-11-25 11:11:27 [INFO]   DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
+2026-11-25 11:11:27 [INFO]   salesdb                  OK        -          8.0K     0m00s    /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 11:11:27 [INFO] Run finished OK in 0m00s
+```
+
+---
+
+## 7. One schema or table (or schema-only / data-only)
+**When:** you only need one schema or table, not the whole dump. For `-n`, the wrapper runs `CREATE SCHEMA IF NOT EXISTS` first (pg_restore itself does not). `-s` restores definitions only; `-a` restores data only (the schema must already exist).
+```bash
+./pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump \
+  -d sales_only -h db2.example.internal -U dba_admin --create -n sales -t orders --yes \
+  -o /backups/restore-work
+```
+**Sample output:**
+```
+2026-11-25 10:12:13 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
+2026-11-25 10:12:13 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
+2026-11-25 10:12:13 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
+2026-11-25 10:12:13 [INFO] File map (1):
+2026-11-25 10:12:13 [INFO]   salesdb_20261125_101209.dump -> sales_only  (8.0K, custom)
+2026-11-25 10:12:13 [INFO] Checksum OK: salesdb_20261125_101209.dump
+2026-11-25 10:12:13 [INFO] Connected: server_version_num=170012
+
+RESTORE SUMMARY
+  Target     : db2.example.internal:5432  user=dba_admin
+  Source     : /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump  (1 file(s), 8.0K)
+  Files      : salesdb_20261125_101209.dump -> sales_only  (new, will be created)
+  Options    : --create -n sales -t orders --no-owner
+  Checksums  : 1 OK
+  Backup     : none needed (no existing tables will be overwritten)
+  Schemas    : CREATE SCHEMA IF NOT EXISTS for: sales
+
+2026-11-25 10:12:13 [INFO] Approval skipped (--yes)
+2026-11-25 10:12:13 [INFO] [sales_only] Creating database sales_only (--create; it does not exist)
+2026-11-25 10:12:14 [INFO] [sales_only] Ensuring schema(s) exist (-n): sales
+2026-11-25 10:12:14 [INFO] [sales_only] Command: psql -X -w -q -v ON_ERROR_STOP=1 -h db2.example.internal -p 5432 -U dba_admin -d sales_only -c CREATE\ SCHEMA\ IF\ NOT\ EXISTS\ \"sales\"
+2026-11-25 10:12:14 [INFO] [sales_only] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:14 [INFO] [sales_only] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d sales_only --no-password --schema=sales --table=orders --no-owner /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:14 [INFO] [sales_only] Restore finished in 0m01s
+2026-11-25 10:12:14 [INFO] Summary:
+2026-11-25 10:12:14 [INFO]   DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
+2026-11-25 10:12:14 [INFO]   sales_only               OK        -          8.0K     0m01s    /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:14 [INFO] Run finished OK in 0m01s
 ```
 
 Schema only, or data only:
 ```bash
-pg_restore_wrapper.sh --from /backups/salesdb_20261124_010015.dump -d salesdb_empty -h db2.example.internal --create -s
-pg_restore_wrapper.sh --from /backups/salesdb_20261124_010015.dump -d salesdb -h db2.example.internal -a --backup-first
+./pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump \
+  -d salesdb_empty -h db2.example.internal -U dba_admin --create -s --yes -o /backups/restore-work
+./pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump \
+  -d salesdb -h db2.example.internal -U dba_admin -a --backup-first --yes -o /backups/restore-work
 ```
 
-Pass anything else straight to pg_restore after `--`:
+---
+
+## 8. Many servers with `--servers`
+**When:** the same dumps should be restored to several hosts, one after another, with one summary. Host and port come from the file (`-h` / `-p` are rejected). A server that is down is recorded as `FAIL(2)` and the others continue; the run exits with the highest code. This sample also uses `--force` because `salesdb` already existed on the reachable server.
 ```bash
-pg_restore_wrapper.sh --from /backups/salesdb.dump -d salesdb -h db2.example.internal -- --disable-triggers
-```
-
-## Folders and mapping
-
-Nothing is guessed from file names. Map each file (or glob) to a database:
-```bash
-pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432 \
-  --map 'salesdb_*=salesdb' --map 'hrdb_*=hrdb' \
-  -h db2.example.internal -U dba_admin --create --clean --if-exists -j 4
-```
-
-Restore to different names (a refresh into a copy):
-```bash
-pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432 \
-  --map 'salesdb_*=salesdb_uat' --map 'hrdb_*=hrdb_uat' -h uat.example.internal --create --clean --if-exists
-```
-
-Keep the mapping in a file:
-```bash
-cat > /etc/pg_restore/map.txt <<'MAP'
-# FILE=DB  (name or shell glob; first match wins)
-salesdb_*=salesdb_uat
-hrdb_*=hrdb_uat
-MAP
-pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432 --map-file /etc/pg_restore/map.txt -h uat.example.internal --create
-```
-
-Only some files from a folder. A selected file with no mapping stops the run (exit 2), so exclude the ones you don't want:
-```bash
-pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432 --include 'salesdb_*' --map 'salesdb_*=salesdb' -h db2.example.internal
-pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432 --exclude 'hrdb_*'    --map 'salesdb_*=salesdb' -h db2.example.internal
-```
-
-Several dates of the same dump in the folder: the newest is used and the older ones are logged as skipped. Pin an older one with `--include`:
-```bash
-pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432 \
-  --include 'salesdb_20261117_*' --map 'salesdb_*=salesdb' -h db2.example.internal --clean --if-exists --backup-first
-```
-
-## Existing tables
-
-Tables in the dump that already exist in the target are never overwritten silently.
-If any exist and `--clean` is not set, the run refuses with exit 2 (unless you pass `--data-only`). Use `--clean --if-exists` for a full replace.
-
-```bash
-# back them up with pg_dump_wrapper.sh (default method) after approval
-pg_restore_wrapper.sh --from salesdb.dump -d salesdb -h db2.example.internal --clean --if-exists --backup-first
-# copy them in the same database: public.orders_bkp_20261125_0130, ...
-pg_restore_wrapper.sh --from salesdb.dump -d salesdb -h db2.example.internal --clean --if-exists --backup-first=psql
-# copies into their own schema
-pg_restore_wrapper.sh --from salesdb.dump -d salesdb -h db2.example.internal --clean --if-exists --backup-first=psql --backup-schema bk_restore
-# no backup at all (the summary says NONE - --force)
-pg_restore_wrapper.sh --from salesdb.dump -d salesdb -h db2.example.internal --clean --if-exists --force
-```
-
-Without any of these, on a terminal you get a warning and a question:
-```
-[WARN] 3 existing table(s) would be overwritten by this restore:
-[WARN]   db2.example.internal:5432/salesdb: public.regions, sales.customers, sales.orders
-Back them up first? [dump / psql / skip / cancel]:
-```
-- `dump` or `psql`: the backup is taken now, then you see the summary and approve.
-- `skip`: type `OVERWRITE 3` to confirm.
-- `cancel` or anything else: stops (exit 2).
-
-With `--yes` or in cron, the run refuses (exit 2) and prints the `pg_dump_wrapper.sh` command you could run first.
-
-If any backup fails, no restore starts (exit 5).
-
-## Aurora / RDS
-
-The master user is not a superuser, so it cannot set object owners to other roles. `--no-owner` is the default (and you usually also want `-x`):
-```bash
-pg_restore_wrapper.sh --from salesdb.dump -d salesdb -h mycluster.cluster-abc123.ap-south-1.rds.amazonaws.com \
-  -U dba_admin --pgpassfile ~/.pgpass --create --clean --if-exists --no-privileges --backup-first
-```
-`--keep-owner` turns the default off. That usually fails with `must be able to SET ROLE "postgres"`, and the wrapper prints a hint to drop `--keep-owner` or use `--role`.
-
-Restore as the application owner so the new objects belong to it:
-```bash
-pg_restore_wrapper.sh --from salesdb.dump -d salesdb -h db2.example.internal -U dba_admin --no-owner --role app_owner --clean --if-exists --backup-first
-```
-`--role` is also used for `CREATE DATABASE` and for the psql backup copies.
-
-## Plain SQL dumps
-
-`.sql` and `.sql.gz` go through `psql -v ON_ERROR_STOP=1` (with `gzip -dc` for `.gz`):
-```bash
-pg_restore_wrapper.sh --from /backups/plaindb_20261124_010000.sql    -d plaindb -h db2.example.internal --create --no-owner
-pg_restore_wrapper.sh --from /backups/plaindb_20261124_010000.sql.gz -d plaindb -h db2.example.internal --create --no-owner --no-privileges
-```
-For plain dumps, `-O` drops `ALTER ... OWNER TO ...;` lines and `-x` drops `GRANT`/`REVOKE` lines. `-j`, `-c`, `-n`, `-t`, `-s`, `-a` do not apply: make the dump with the options you need (`pg_dump_wrapper.sh -F plain --clean --if-exists ...`).
-
-## Many servers
-
-`servers.txt`:
-```
+# /etc/pg_restore/servers.txt
 # host,port,user,databases
-db1.example.internal,5432,dba_admin,all
-db2.example.internal,5432,dba_admin,salesdb
-db3.example.internal,5433,,all
+db3.example.internal,5432,dba_admin,all
+db2.example.internal,5432,dba_admin,salesdb,hrdb
 ```
-`databases` = `all`, or a comma list of the target databases to restore on that server. An empty user means `-U`.
 ```bash
-pg_restore_wrapper.sh --servers /etc/pg_restore/servers.txt --pgpassfile /etc/pg_restore/.pgpass \
-  --from /backups/salesdb_20261124_010015.dump -d salesdb --clean --if-exists --no-owner --backup-first=psql
+./pg_restore_wrapper.sh --servers /etc/pg_restore/servers.txt \
+  --from /backups/postgres/db1.example.internal_5432 \
+  --map 'salesdb_*=salesdb' --map 'hrdb_*=hrdb' \
+  --create --clean --if-exists --force --yes -o /backups/restore-work
 ```
-- Approval is `RESTORE N`, where N counts the reachable servers. A down server is a `FAIL(2) precheck` row, and the others still run.
-- All backups on all servers run before any restore.
-- `-h`, `-p` and `-W` are not allowed with `--servers`. Use one pgpass line per `host:port`.
-
-## Config file and cron
-
-```bash
-cp pg_restore_wrapper.conf.example /etc/pg_restore/pg_restore_wrapper.conf   # edit it
-pg_restore_wrapper.sh --config /etc/pg_restore/pg_restore_wrapper.conf --from /backups/salesdb.dump -d salesdb --dry-run
+**Sample output:**
 ```
-
-A nightly refresh of a UAT copy. Cron has no terminal, so it needs `--yes`, and existing tables need `backup_first=` or `--force`:
-```
-30 2 * * * /opt/pg-tools/pg_restore_wrapper.sh --config /etc/pg_restore/uat.conf --yes >>/var/log/pg_restore_cron.log 2>&1
-```
-Without `--yes` a cron run refuses with exit 2. The RESTORE SUMMARY is still written to the log.
-
-## Alerts
-
-```bash
-pg_restore_wrapper.sh --alert-webhook https://hooks.slack.com/services/T000/B000/XXXX --alert-test
-pg_restore_wrapper.sh --from salesdb.dump -d salesdb -h db2.example.internal --backup-first --yes \
-  --alert-email dba@example.com --alert-webhook https://example.com/hook --alert-webhook-format json --alert-on always
-```
-Alerts go out on failure by default. A run cancelled at a prompt sends no alert, and alerts never change the exit code.
-
-## Backup locations
-
-The wrapper does not roll anything back. After a run that took backups, it prints where each one was saved, and leaves them for you to use if you need to recover by hand:
-
-```
-[INFO] Pre-restore backups saved:
-  [dump] db2.example.internal:5432/salesdb  /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_045407.dump
-  [psql] db2.example.internal:5432/salesdb  public.orders_bkp_20261125_0454  (copy of sales.orders, 500 rows)
-```
-- dump method: one `.dump` file per database (plus its `.sha256`) under `OUTPUT_DIR/pre_restore_backups/<host>_<port>/`.
-- psql method: a table named `<backup-schema>.<table>_bkp_<YYYYMMDD_HHMM>` in the same database (`_2`, `_3` on a name collision).
-
-## Exit codes in scripts
-
-```bash
-pg_restore_wrapper.sh --config /etc/pg_restore/uat.conf --yes
-case $? in
-  0) echo "restored" ;;
-  2) echo "refused or pre-check failed: nothing was restored" ;;
-  3) echo "a restore failed: check the log and the pre-restore backups" ;;
-  4) echo "checksum mismatch" ;;
-  5) echo "pre-restore backup failed: nothing was restored" ;;
-  *) echo "other error" ;;
-esac
-```
-
-## Real output
-
-The runs below are real (PostgreSQL 17, non-superuser login) with fake host names and paths substituted afterwards.
-
-Note: sections 5 and 5c were captured when a missing `--clean` only warned and then let pg_restore fail. The wrapper now **refuses with exit 2** in that situation (unless `--data-only` is set), so you will not see a restore start without `--clean`. `--no-owner` is also the default now, even if you omit it from the command line.
-
-```text
-------------------------------------------------------------------------------
-1) --dry-run of a folder (newest dump per database, file map, checksums, existing-table warning)
-------------------------------------------------------------------------------
-$ pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432 --map 'salesdb_*=salesdb' --map 'hrdb_*=hrdb' -h db2.example.internal -U dba_admin --create --clean --if-exists --no-owner --no-privileges -j 4 --dry-run -o /backups/restore-work
-2026-11-25 04:54:05 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
-2026-11-25 04:54:05 [INFO] DRY RUN - nothing will be created, backed up or restored
-2026-11-25 04:54:05 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
-2026-11-25 04:54:05 [INFO] Source /backups/postgres/db1.example.internal_5432: 2 dump file(s) selected, 1 older file(s) skipped
-2026-11-25 04:54:05 [INFO] Skipping older dump (a newer file of the same dump is selected): /backups/postgres/db1.example.internal_5432/salesdb_20261117_010002.dump
-2026-11-25 04:54:05 [INFO] File map (2):
-2026-11-25 04:54:05 [INFO]   hrdb_20261125_045405.dump    -> hrdb  (4.0K, custom)
-2026-11-25 04:54:05 [INFO]   salesdb_20261125_045405.dump -> salesdb  (8.0K, custom)
-2026-11-25 04:54:05 [INFO] Checksum OK: hrdb_20261125_045405.dump
-2026-11-25 04:54:05 [INFO] Checksum OK: salesdb_20261125_045405.dump
-2026-11-25 04:54:05 [INFO] Connected: server_version_num=170012
-2026-11-25 04:54:05 [WARN] 3 existing table(s) would be overwritten by this restore:
-2026-11-25 04:54:05 [WARN]   db2.example.internal:5432/salesdb: public.regions, sales.customers, sales.orders
-2026-11-25 04:54:05 [INFO] DRY RUN - would ask: back them up first? [dump / psql / skip / cancel]
-
-RESTORE SUMMARY
-  Target     : db2.example.internal:5432  user=dba_admin
-  Source     : /backups/postgres/db1.example.internal_5432  (2 file(s), 12K; 1 older file(s) skipped)
-  Files      : hrdb_20261125_045405.dump    -> hrdb  (new, will be created)
-               salesdb_20261125_045405.dump -> salesdb  (exists, 3 table(s) will be overwritten)
-  Options    : --clean --if-exists --create -j 4 --no-owner --no-privileges
-  Checksums  : 2 OK
-  Backup     : 3 table(s) via pg_dump_wrapper.sh -> /backups/restore-work/pre_restore_backups/
-
-2026-11-25 04:54:05 [INFO] DRY RUN - pre-restore backup (dump) would run:
-bash /opt/pg-tools/pg_dump_wrapper.sh -h db2.example.internal -p 5432 -U dba_admin -d salesdb -F custom --checksum --table-sizes 0 --min-free-mb 1 -o /backups/restore-work/pre_restore_backups/db2.example.internal_5432 --pgpassfile /home/dba/.pgpass -t \"public\".\"regions\" -t \"sales\".\"customers\" -t \"sales\".\"orders\"
-2026-11-25 04:54:05 [INFO] DRY RUN - restore commands:
-psql -X -w -q -v ON_ERROR_STOP=1 -h db2.example.internal -p 5432 -U dba_admin -d postgres -c CREATE\ DATABASE\ \"hrdb\"
-pg_restore -h db2.example.internal -p 5432 -U dba_admin -d hrdb --no-password --jobs=4 --clean --if-exists --no-owner --no-privileges /backups/postgres/db1.example.internal_5432/hrdb_20261125_045405.dump
-pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password --jobs=4 --clean --if-exists --no-owner --no-privileges /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:05 [INFO] DRY RUN - approval would be required: type db2.example.internal
-
-
-------------------------------------------------------------------------------
-2) Same restore by hand: existing-table prompt (answer: psql), RESTORE SUMMARY, host-name approval
-------------------------------------------------------------------------------
-$ same command, no --dry-run, run by hand (answers: psql, then the host name)
-psql
-db2.example.internal
-2026-11-25 04:54:05 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
-2026-11-25 04:54:05 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
-2026-11-25 04:54:05 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
-2026-11-25 04:54:05 [INFO] Free space in /backups/restore-work: 123577 MB
-2026-11-25 04:54:05 [INFO] Source /backups/postgres/db1.example.internal_5432: 2 dump file(s) selected, 1 older file(s) skipped
-2026-11-25 04:54:05 [INFO] Skipping older dump (a newer file of the same dump is selected): /backups/postgres/db1.example.internal_5432/salesdb_20261117_010002.dump
-2026-11-25 04:54:05 [INFO] File map (2):
-2026-11-25 04:54:05 [INFO]   hrdb_20261125_045405.dump    -> hrdb  (4.0K, custom)
-2026-11-25 04:54:05 [INFO]   salesdb_20261125_045405.dump -> salesdb  (8.0K, custom)
-2026-11-25 04:54:06 [INFO] Checksum OK: hrdb_20261125_045405.dump
-2026-11-25 04:54:06 [INFO] Checksum OK: salesdb_20261125_045405.dump
-2026-11-25 04:54:06 [INFO] Connected: server_version_num=170012
-2026-11-25 04:54:06 [WARN] 3 existing table(s) would be overwritten by this restore:
-2026-11-25 04:54:06 [WARN]   db2.example.internal:5432/salesdb: public.regions, sales.customers, sales.orders
-Back them up first? [dump / psql / skip / cancel]: 2026-11-25 04:54:06 [INFO] Answer: psql
-2026-11-25 04:54:06 [INFO] Starting pre-restore backups (psql): 3 table(s)
-2026-11-25 04:54:06 [INFO] [salesdb] Backing up public.regions with psql -> public.regions_bkp_20261125_0454
-2026-11-25 04:54:06 [INFO] [salesdb] psql copy OK: public.regions_bkp_20261125_0454 (2 rows)
-2026-11-25 04:54:06 [INFO] [salesdb] Backing up sales.customers with psql -> public.customers_bkp_20261125_0454
-2026-11-25 04:54:06 [INFO] [salesdb] psql copy OK: public.customers_bkp_20261125_0454 (40 rows)
-2026-11-25 04:54:06 [INFO] [salesdb] Backing up sales.orders with psql -> public.orders_bkp_20261125_0454
-2026-11-25 04:54:06 [INFO] [salesdb] psql copy OK: public.orders_bkp_20261125_0454 (500 rows)
-2026-11-25 04:54:06 [INFO] Pre-restore backups finished OK (psql)
-
-RESTORE SUMMARY
-  Target     : db2.example.internal:5432  user=dba_admin
-  Source     : /backups/postgres/db1.example.internal_5432  (2 file(s), 12K; 1 older file(s) skipped)
-  Files      : hrdb_20261125_045405.dump    -> hrdb  (new, will be created)
-               salesdb_20261125_045405.dump -> salesdb  (exists, 3 table(s) will be overwritten)
-  Options    : --clean --if-exists --create -j 4 --no-owner --no-privileges
-  Checksums  : 2 OK
-  Backup     : 3 table(s) already backed up (psql); locations are printed at the end
-
-Type the target host name to continue (db2.example.internal), anything else cancels: 2026-11-25 04:54:06 [INFO] Answer: db2.example.internal
-2026-11-25 04:54:06 [INFO] Approval accepted (db2.example.internal)
-2026-11-25 04:54:06 [INFO] [hrdb] Creating database hrdb (--create; it does not exist)
-2026-11-25 04:54:06 [INFO] [hrdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/hrdb_20261125_045405.dump
-2026-11-25 04:54:06 [INFO] [hrdb] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d hrdb --no-password --jobs=4 --clean --if-exists --no-owner --no-privileges /backups/postgres/db1.example.internal_5432/hrdb_20261125_045405.dump
-2026-11-25 04:54:06 [INFO] [hrdb] Restore finished in 0m00s
-2026-11-25 04:54:06 [INFO] [salesdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:06 [INFO] [salesdb] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password --jobs=4 --clean --if-exists --no-owner --no-privileges /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:06 [INFO] [salesdb] Restore finished in 0m00s
-2026-11-25 04:54:06 [INFO] Pre-restore backups saved:
-  [psql] db2.example.internal:5432/salesdb  public.regions_bkp_20261125_0454  (copy of public.regions, 2 rows)
-  [psql] db2.example.internal:5432/salesdb  public.customers_bkp_20261125_0454  (copy of sales.customers, 40 rows)
-  [psql] db2.example.internal:5432/salesdb  public.orders_bkp_20261125_0454  (copy of sales.orders, 500 rows)
-2026-11-25 04:54:06 [INFO] Summary:
-2026-11-25 04:54:06 [INFO]   DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
-2026-11-25 04:54:06 [INFO]   hrdb                     OK        -          4.0K     0m00s    /backups/postgres/db1.example.internal_5432/hrdb_20261125_045405.dump
-2026-11-25 04:54:06 [INFO]   salesdb                  OK        -          8.0K     0m00s    /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:06 [INFO] Run finished OK in 0m01s
-
-
-------------------------------------------------------------------------------
-3) Single file with --backup-first (dump via pg_dump_wrapper.sh) and --yes
-------------------------------------------------------------------------------
-$ pg_restore_wrapper.sh --from .../salesdb_20261125_045407.dump -d salesdb -h db2.example.internal -U dba_admin --clean --if-exists --backup-first --no-owner --no-privileges --yes -o /backups/restore-work
-2026-11-25 04:54:06 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
-2026-11-25 04:54:06 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
-2026-11-25 04:54:06 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
-2026-11-25 04:54:06 [INFO] Free space in /backups/restore-work: 123575 MB
-2026-11-25 04:54:06 [INFO] File map (1):
-2026-11-25 04:54:06 [INFO]   salesdb_20261125_045405.dump -> salesdb  (8.0K, custom)
-2026-11-25 04:54:06 [INFO] Checksum OK: salesdb_20261125_045405.dump
-2026-11-25 04:54:06 [INFO] Connected: server_version_num=170012
-
-RESTORE SUMMARY
-  Target     : db2.example.internal:5432  user=dba_admin
-  Source     : /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump  (1 file(s), 8.0K)
-  Files      : salesdb_20261125_045405.dump -> salesdb  (exists, 3 table(s) will be overwritten)
-  Options    : --clean --if-exists --no-owner --no-privileges
-  Checksums  : 1 OK
-  Backup     : 3 table(s) via pg_dump_wrapper.sh -> /backups/restore-work/pre_restore_backups/
-
-2026-11-25 04:54:06 [INFO] Approval skipped (--yes)
-2026-11-25 04:54:06 [INFO] Starting pre-restore backups (dump): 3 table(s)
-2026-11-25 04:54:06 [INFO] [salesdb] Backing up public.regions, sales.customers, sales.orders with pg_dump_wrapper.sh
-2026-11-25 04:54:06 [INFO] [salesdb] Command: bash /opt/pg-tools/pg_dump_wrapper.sh -h db2.example.internal -p 5432 -U dba_admin -d salesdb -F custom --checksum --table-sizes 0 --min-free-mb 1 -o /backups/restore-work/pre_restore_backups/db2.example.internal_5432 --pgpassfile /home/dba/.pgpass -t \"public\".\"regions\" -t \"sales\".\"customers\" -t \"sales\".\"orders\"
-2026-11-25 04:54:07 [INFO] [salesdb] pg_dump_wrapper.sh OK: /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_045407.dump (8.0K, 0m01s)
-2026-11-25 04:54:07 [INFO] Pre-restore backups finished OK (dump)
-2026-11-25 04:54:07 [INFO] [salesdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:07 [INFO] [salesdb] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password --clean --if-exists --no-owner --no-privileges /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:07 [INFO] [salesdb] Restore finished in 0m00s
-2026-11-25 04:54:07 [INFO] Pre-restore backups saved:
-  [dump] db2.example.internal:5432/salesdb  /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_045407.dump
-2026-11-25 04:54:07 [INFO] Summary:
-2026-11-25 04:54:07 [INFO]   DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
-2026-11-25 04:54:07 [INFO]   salesdb                  OK        -          8.0K     0m00s    /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:07 [INFO] Run finished OK in 0m01s
-
-
-------------------------------------------------------------------------------
-5) Cron / no terminal: existing tables without --backup-first or --force -> refused (exit 2)
-------------------------------------------------------------------------------
-$ cron / no terminal, existing tables, no --backup-first or --force
-2026-11-25 04:54:07 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
-2026-11-25 04:54:07 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
-2026-11-25 04:54:07 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
-2026-11-25 04:54:07 [INFO] Free space in /backups/restore-work: 123575 MB
-2026-11-25 04:54:07 [INFO] File map (1):
-2026-11-25 04:54:07 [INFO]   salesdb_20261125_045405.dump -> salesdb  (8.0K, custom)
-2026-11-25 04:54:07 [INFO] Checksum OK: salesdb_20261125_045405.dump
-2026-11-25 04:54:07 [INFO] Connected: server_version_num=170012
-2026-11-25 04:54:07 [WARN] --clean is not set: restoring over existing tables gives 'already exists' / duplicate key errors (FAIL(3)) and can add rows to the old data. For a full replace add --clean --if-exists.
-2026-11-25 04:54:07 [WARN] 3 existing table(s) would be overwritten by this restore:
-2026-11-25 04:54:07 [WARN]   db2.example.internal:5432/salesdb: public.regions, sales.customers, sales.orders
-2026-11-25 04:54:07 [INFO] Back them up first, for example:
-bash /opt/pg-tools/pg_dump_wrapper.sh -h db2.example.internal -p 5432 -U dba_admin -d salesdb -F custom --checksum --table-sizes 0 --min-free-mb 1 -o /backups/restore-work/pre_restore_backups/db2.example.internal_5432 --pgpassfile /home/dba/.pgpass -t \"public\".\"regions\" -t \"sales\".\"customers\" -t \"sales\".\"orders\"
-2026-11-25 04:54:07 [INFO] or re-run with --backup-first (dump), --backup-first=psql, or --force to skip the backup.
-2026-11-25 04:54:07 [ERROR] 3 existing table(s) would be overwritten and neither --backup-first nor --force was given (--yes never overwrites tables without a backup). Nothing was restored.
-2026-11-25 04:54:07 [ERROR] Run finished with exit code 2 (stage: precheck)
-
-
-------------------------------------------------------------------------------
-5b) A selected file with no --map -> refused (exit 2)
-------------------------------------------------------------------------------
-$ a selected file with no --map
-2026-11-25 04:54:07 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
-2026-11-25 04:54:07 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
-2026-11-25 04:54:07 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
-2026-11-25 04:54:07 [INFO] Free space in /backups/restore-work: 123575 MB
-2026-11-25 04:54:07 [INFO] Source /backups/postgres/db1.example.internal_5432: 2 dump file(s) selected, 1 older file(s) skipped
-2026-11-25 04:54:07 [INFO] Skipping older dump (a newer file of the same dump is selected): /backups/postgres/db1.example.internal_5432/salesdb_20261117_010002.dump
-2026-11-25 04:54:07 [ERROR] No --map for selected file: hrdb_20261125_045405.dump
-2026-11-25 04:54:07 [ERROR] 1 selected file(s) have no target database. Add --map 'FILE=DB' (globs allowed) or a --map-file line for each, or leave them out with --exclude. Nothing was restored.
-2026-11-25 04:54:07 [ERROR] Run finished with exit code 2 (stage: precheck)
-
-
-------------------------------------------------------------------------------
-5c) One file fails (salesdb without --clean), the other continues (hrdb_new)
-------------------------------------------------------------------------------
-$ one file fails, the other continues: --map 'hrdb_*=hrdb_new' --create, salesdb without --clean, --force
-2026-11-25 04:54:07 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
-2026-11-25 04:54:07 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
-2026-11-25 04:54:07 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
-2026-11-25 04:54:07 [INFO] Free space in /backups/restore-work: 123575 MB
-2026-11-25 04:54:07 [INFO] Source /backups/postgres/db1.example.internal_5432: 2 dump file(s) selected, 1 older file(s) skipped
-2026-11-25 04:54:07 [INFO] Skipping older dump (a newer file of the same dump is selected): /backups/postgres/db1.example.internal_5432/salesdb_20261117_010002.dump
-2026-11-25 04:54:07 [INFO] File map (2):
-2026-11-25 04:54:07 [INFO]   hrdb_20261125_045405.dump    -> hrdb_new  (4.0K, custom)
-2026-11-25 04:54:07 [INFO]   salesdb_20261125_045405.dump -> salesdb  (8.0K, custom)
-2026-11-25 04:54:07 [INFO] Checksum OK: hrdb_20261125_045405.dump
-2026-11-25 04:54:07 [INFO] Checksum OK: salesdb_20261125_045405.dump
-2026-11-25 04:54:07 [INFO] Connected: server_version_num=170012
-2026-11-25 04:54:07 [WARN] --clean is not set: restoring over existing tables gives 'already exists' / duplicate key errors (FAIL(3)) and can add rows to the old data. For a full replace add --clean --if-exists.
-2026-11-25 04:54:07 [WARN] --force: 3 existing table(s) will be overwritten without a backup
-
-RESTORE SUMMARY
-  Target     : db2.example.internal:5432  user=dba_admin
-  Source     : /backups/postgres/db1.example.internal_5432  (2 file(s), 12K; 1 older file(s) skipped)
-  Files      : hrdb_20261125_045405.dump    -> hrdb_new  (new, will be created)
-               salesdb_20261125_045405.dump -> salesdb  (exists, 3 table(s) will be overwritten)
-  Options    : --create --no-owner --no-privileges
-  Checksums  : 2 OK
-  Backup     : NONE - --force, 3 table(s) overwritten without a backup
-
-2026-11-25 04:54:07 [INFO] Approval skipped (--yes)
-2026-11-25 04:54:07 [INFO] [hrdb_new] Creating database hrdb_new (--create; it does not exist)
-2026-11-25 04:54:07 [INFO] [hrdb_new] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/hrdb_20261125_045405.dump
-2026-11-25 04:54:07 [INFO] [hrdb_new] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d hrdb_new --no-password --no-owner --no-privileges /backups/postgres/db1.example.internal_5432/hrdb_20261125_045405.dump
-2026-11-25 04:54:07 [INFO] [hrdb_new] Restore finished in 0m00s
-2026-11-25 04:54:07 [INFO] [salesdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:07 [INFO] [salesdb] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password --no-owner --no-privileges /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:07 [ERROR] [salesdb] pg_restore: error: could not execute query: ERROR:  schema "sales" already exists
-2026-11-25 04:54:07 [INFO] [salesdb] Command was: CREATE SCHEMA sales;
-2026-11-25 04:54:07 [ERROR] [salesdb] pg_restore: error: could not execute query: ERROR:  relation "regions" already exists
-2026-11-25 04:54:07 [INFO] [salesdb] Command was: CREATE TABLE public.regions (
-2026-11-25 04:54:07 [INFO] [salesdb]     id integer,
-2026-11-25 04:54:07 [INFO] [salesdb]     name text
-2026-11-25 04:54:07 [INFO] [salesdb] );
-2026-11-25 04:54:07 [ERROR] [salesdb] pg_restore: error: could not execute query: ERROR:  relation "customers" already exists
-2026-11-25 04:54:07 [INFO] [salesdb] Command was: CREATE TABLE sales.customers (
-2026-11-25 04:54:07 [INFO] [salesdb]     id integer NOT NULL,
-2026-11-25 04:54:07 [INFO] [salesdb]     name text
-2026-11-25 04:54:07 [INFO] [salesdb] );
-2026-11-25 04:54:07 [ERROR] [salesdb] pg_restore: error: could not execute query: ERROR:  relation "orders" already exists
-2026-11-25 04:54:07 [INFO] [salesdb] Command was: CREATE TABLE sales.orders (
-2026-11-25 04:54:07 [INFO] [salesdb]     id integer NOT NULL,
-2026-11-25 04:54:07 [INFO] [salesdb]     amount numeric,
-2026-11-25 04:54:07 [INFO] [salesdb]     note text
-2026-11-25 04:54:07 [INFO] [salesdb] );
-2026-11-25 04:54:07 [ERROR] [salesdb] pg_restore: error: could not execute query: ERROR:  relation "orders_id_seq" already exists
-2026-11-25 04:54:07 [INFO] [salesdb] Command was: ALTER TABLE sales.orders ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
-2026-11-25 04:54:07 [INFO] [salesdb]     SEQUENCE NAME sales.orders_id_seq
-2026-11-25 04:54:07 [INFO] [salesdb]     START WITH 1
-2026-11-25 04:54:07 [INFO] [salesdb]     INCREMENT BY 1
-2026-11-25 04:54:07 [INFO] [salesdb]     NO MINVALUE
-2026-11-25 04:54:07 [INFO] [salesdb]     NO MAXVALUE
-2026-11-25 04:54:07 [INFO] [salesdb]     CACHE 1
-2026-11-25 04:54:08 [INFO] [salesdb] );
-2026-11-25 04:54:08 [ERROR] [salesdb] pg_restore: error: COPY failed for table "customers": ERROR:  duplicate key value violates unique constraint "customers_pkey"
-2026-11-25 04:54:08 [INFO] [salesdb] DETAIL:  Key (id)=(1) already exists.
-2026-11-25 04:54:08 [INFO] [salesdb] CONTEXT:  COPY customers, line 1
-2026-11-25 04:54:08 [ERROR] [salesdb] pg_restore: error: COPY failed for table "orders": ERROR:  duplicate key value violates unique constraint "orders_pkey"
-2026-11-25 04:54:08 [INFO] [salesdb] DETAIL:  Key (id)=(1) already exists.
-2026-11-25 04:54:08 [INFO] [salesdb] CONTEXT:  COPY orders, line 1
-2026-11-25 04:54:08 [ERROR] [salesdb] pg_restore: error: could not execute query: ERROR:  multiple primary keys for table "customers" are not allowed
-2026-11-25 04:54:08 [INFO] [salesdb] Command was: ALTER TABLE ONLY sales.customers
-2026-11-25 04:54:08 [INFO] [salesdb]     ADD CONSTRAINT customers_pkey PRIMARY KEY (id);
-2026-11-25 04:54:08 [ERROR] [salesdb] pg_restore: error: could not execute query: ERROR:  multiple primary keys for table "orders" are not allowed
-2026-11-25 04:54:08 [INFO] [salesdb] Command was: ALTER TABLE ONLY sales.orders
-2026-11-25 04:54:08 [INFO] [salesdb]     ADD CONSTRAINT orders_pkey PRIMARY KEY (id);
-2026-11-25 04:54:08 [INFO] [salesdb] pg_restore: warning: errors ignored on restore: 9
-2026-11-25 04:54:08 [ERROR] [salesdb] Restore failed (exit 1) after 0m01s
-2026-11-25 04:54:08 [INFO] Summary:
-2026-11-25 04:54:08 [INFO]   DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
-2026-11-25 04:54:08 [INFO]   hrdb_new                 OK        -          4.0K     0m00s    /backups/postgres/db1.example.internal_5432/hrdb_20261125_045405.dump
-2026-11-25 04:54:08 [INFO]   salesdb                  FAIL(3)   restore    8.0K     0m01s    /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:08 [ERROR] Run finished with exit code 3 (stage: restore (salesdb))
-
-
-------------------------------------------------------------------------------
-6) --servers with one server down, psql backups, RESTORE N approval
-------------------------------------------------------------------------------
-$ pg_restore_wrapper.sh --servers /etc/pg_restore/servers.txt --from .../salesdb_20261125_045407.dump -d salesdb --clean --if-exists --no-owner --no-privileges --backup-first=psql -o /backups/restore-work (answer: RESTORE 1)
-RESTORE 1
-2026-11-25 04:54:08 [INFO] ===== pg_restore_wrapper.sh v1.0.0: 2 server(s) from /etc/pg_restore/servers.txt: db1.example.internal:5432, db3.example.internal:5432 =====
-2026-11-25 04:54:08 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
-2026-11-25 04:54:08 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
-2026-11-25 04:54:08 [INFO] Free space in /backups/restore-work: 123556 MB
-2026-11-25 04:54:08 [INFO] File map (1):
-2026-11-25 04:54:08 [INFO]   salesdb_20261125_045405.dump -> salesdb  (8.0K, custom)
-2026-11-25 04:54:08 [INFO] Checksum OK: salesdb_20261125_045405.dump
-2026-11-25 04:54:08 [INFO] [db1.example.internal:5432] Server 1/2: user=dba_admin databases=all
-2026-11-25 04:54:08 [INFO] [db1.example.internal:5432] Connected: server_version_num=170012
-2026-11-25 04:54:08 [INFO] [db3.example.internal:5432] Server 2/2: user=dba_admin databases=all
-2026-11-25 04:54:08 [ERROR] [db3.example.internal:5432] Server not accepting connections at db3.example.internal:5432 (pg_isready)
+2026-11-25 10:12:14 [INFO] ===== pg_restore_wrapper.sh v1.0.0: 2 server(s) from /etc/pg_restore/servers.txt: db3.example.internal:5432, db2.example.internal:5432 =====
+2026-11-25 10:12:14 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
+2026-11-25 10:12:14 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
+2026-11-25 10:12:14 [INFO] Source /backups/postgres/db1.example.internal_5432: 2 dump file(s) selected, 1 older file(s) skipped
+2026-11-25 10:12:14 [INFO] Skipping older dump (a newer file of the same dump is selected): /backups/postgres/db1.example.internal_5432/salesdb_20261117_010002.dump
+2026-11-25 10:12:14 [INFO] File map (2):
+2026-11-25 10:12:14 [INFO]   hrdb_20261125_101209.dir     -> hrdb  (12K, directory)
+2026-11-25 10:12:14 [INFO]   salesdb_20261125_101209.dump -> salesdb  (8.0K, custom)
+2026-11-25 10:12:14 [INFO] Checksum OK: hrdb_20261125_101209.dir
+2026-11-25 10:12:14 [INFO] Checksum OK: salesdb_20261125_101209.dump
+2026-11-25 10:12:14 [INFO] [db3.example.internal:5432] Server 1/2: user=dba_admin databases=all
+2026-11-25 10:12:14 [ERROR] [db3.example.internal:5432] Server not accepting connections at db3.example.internal:5432 (pg_isready)
+2026-11-25 10:12:14 [INFO] [db2.example.internal:5432] Server 2/2: user=dba_admin databases=salesdb,hrdb
+2026-11-25 10:12:14 [INFO] [db2.example.internal:5432] Connected: server_version_num=170012
+2026-11-25 10:12:14 [WARN] --force: 3 existing table(s) will be overwritten without a backup
 
 RESTORE SUMMARY
   Targets    : 1 of 2 server(s) will be restored (/etc/pg_restore/servers.txt)
-  Source     : /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump  (1 file(s), 8.0K)
-  Server 1   : db1.example.internal:5432  user=dba_admin  databases=all
-  Files      : salesdb_20261125_045405.dump -> salesdb  (exists, 3 table(s) will be overwritten)
-  Server 2   : db3.example.internal:5432  user=dba_admin  databases=all
+  Source     : /backups/postgres/db1.example.internal_5432  (2 file(s), 20K; 1 older file(s) skipped)
+  Server 1   : db3.example.internal:5432  user=dba_admin  databases=all
                (unreachable - will not be restored)
-  Options    : --clean --if-exists --no-owner --no-privileges
-  Checksums  : 1 OK
-  Backup     : 3 table(s) psql copy -> public.<table>_bkp_20261125_0454
+  Server 2   : db2.example.internal:5432  user=dba_admin  databases=salesdb,hrdb
+  Files      : hrdb_20261125_101209.dir     -> hrdb  (new, will be created)
+               salesdb_20261125_101209.dump -> salesdb  (exists, 3 table(s) will be overwritten)
+  Options    : --clean --if-exists --create --no-owner
+  Checksums  : 2 OK
+  Backup     : NONE - --force, 3 table(s) overwritten without a backup
 
-Type RESTORE 1 to continue, anything else cancels: 2026-11-25 04:54:08 [INFO] Answer: RESTORE 1
-2026-11-25 04:54:08 [INFO] Approval accepted (RESTORE 1)
-2026-11-25 04:54:08 [INFO] Starting pre-restore backups (psql): 3 table(s)
-2026-11-25 04:54:08 [INFO] [db1.example.internal:5432/salesdb] Backing up public.regions with psql -> public.regions_bkp_20261125_0454
-2026-11-25 04:54:08 [INFO] [db1.example.internal:5432/salesdb] psql copy OK: public.regions_bkp_20261125_0454 (3 rows)
-2026-11-25 04:54:08 [INFO] [db1.example.internal:5432/salesdb] Backing up sales.customers with psql -> public.customers_bkp_20261125_0454
-2026-11-25 04:54:08 [INFO] [db1.example.internal:5432/salesdb] psql copy OK: public.customers_bkp_20261125_0454 (40 rows)
-2026-11-25 04:54:08 [INFO] [db1.example.internal:5432/salesdb] Backing up sales.orders with psql -> public.orders_bkp_20261125_0454
-2026-11-25 04:54:08 [INFO] [db1.example.internal:5432/salesdb] psql copy OK: public.orders_bkp_20261125_0454 (500 rows)
-2026-11-25 04:54:08 [INFO] Pre-restore backups finished OK (psql)
-2026-11-25 04:54:08 [INFO] [db1.example.internal:5432/salesdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:08 [INFO] [db1.example.internal:5432/salesdb] Command: pg_restore -h db1.example.internal -p 5432 -U dba_admin -d salesdb --no-password --clean --if-exists --no-owner --no-privileges /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:08 [INFO] [db1.example.internal:5432/salesdb] Restore finished in 0m00s
-2026-11-25 04:54:08 [INFO] Pre-restore backups saved:
-  [psql] db1.example.internal:5432/salesdb  public.regions_bkp_20261125_0454  (copy of public.regions, 3 rows)
-  [psql] db1.example.internal:5432/salesdb  public.customers_bkp_20261125_0454  (copy of sales.customers, 40 rows)
-  [psql] db1.example.internal:5432/salesdb  public.orders_bkp_20261125_0454  (copy of sales.orders, 500 rows)
-2026-11-25 04:54:08 [INFO] Summary:
-2026-11-25 04:54:08 [INFO]   SERVER/DATABASE                   STATUS    STAGE      SIZE     TIME     FILE
-2026-11-25 04:54:08 [INFO]   db3.example.internal:5432         FAIL(2)   precheck   -        0m00s    -
-2026-11-25 04:54:08 [INFO]   db1.example.internal:5432/salesdb OK        -          8.0K     0m00s    /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
-2026-11-25 04:54:08 [ERROR] Run finished with exit code 2 (stage: precheck (db3.example.internal:5432))
+2026-11-25 10:12:14 [INFO] Approval skipped (--yes)
+2026-11-25 10:12:14 [INFO] [db2.example.internal:5432/hrdb] Creating database hrdb (--create; it does not exist)
+2026-11-25 10:12:14 [INFO] [db2.example.internal:5432/hrdb] Starting restore (directory) <- /backups/postgres/db1.example.internal_5432/hrdb_20261125_101209.dir
+2026-11-25 10:12:14 [INFO] [db2.example.internal:5432/hrdb] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d hrdb --no-password --clean --if-exists --no-owner /backups/postgres/db1.example.internal_5432/hrdb_20261125_101209.dir
+2026-11-25 10:12:14 [INFO] [db2.example.internal:5432/hrdb] Restore finished in 0m00s
+2026-11-25 10:12:14 [INFO] [db2.example.internal:5432/salesdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:14 [INFO] [db2.example.internal:5432/salesdb] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password --clean --if-exists --no-owner /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:14 [INFO] [db2.example.internal:5432/salesdb] Restore finished in 0m00s
+2026-11-25 10:12:14 [INFO] Summary:
+2026-11-25 10:12:14 [INFO]   SERVER/DATABASE          STATUS    STAGE      SIZE     TIME     FILE
+2026-11-25 10:12:14 [INFO]   db3.example.internal:5432          FAIL(2)   precheck   -        0m00s    -
+2026-11-25 10:12:14 [INFO]   db2.example.internal:5432/hrdb     OK        -          12K      0m00s    /backups/postgres/db1.example.internal_5432/hrdb_20261125_101209.dir
+2026-11-25 10:12:14 [INFO]   db2.example.internal:5432/salesdb  OK        -          8.0K     0m00s    /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:14 [ERROR] Run finished with exit code 2 (stage: precheck (db3.example.internal:5432))
+```
+
+---
+
+## 9. Test e-mail and webhook alerts
+**When:** you have just configured mail or a webhook and want to prove delivery without restoring. `--alert-test` sends a `TEST` alert to every target and exits. A working MTA (`mail`, `mailx` or `sendmail`) is needed for e-mail; webhooks are posted with `curl`.
+```bash
+./pg_restore_wrapper.sh --alert-test \
+  --alert-email dba@example.com --alert-from pg-restore@example.com \
+  --alert-webhook https://hooks.slack.com/services/XXX/YYY/ZZZ \
+  -o /backups/restore-work
+```
+**Sample output:**
+```
+2026-11-25 10:12:14 [INFO] Sending test alert...
+2026-11-25 10:12:14 [INFO] Alert: e-mail sent to dba@example.com
+2026-11-25 10:12:14 [INFO] Alert: webhook https://hooks.slack.com/... -> HTTP 200
+```
+
+---
+
+## 10. Backup failed (exit 5)
+**When:** a pre-restore backup fails. The restore is not started, the summary shows `FAIL(5)` at stage `backup` and a `SKIPPED` restore row, and the wrapper exits 5. The `[ERROR]` text after `exit 3` comes from `pg_dump_wrapper.sh`.
+```bash
+./pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump \
+  -d salesdb -h db2.example.internal -U dba_admin --clean --if-exists --backup-first --yes \
+  -o /backups/restore-work
+```
+**Sample output:**
+```
+2026-11-25 10:12:14 [INFO] ===== pg_restore_wrapper.sh v1.0.0: host=db2.example.internal port=5432 user=dba_admin =====
+2026-11-25 10:12:14 [INFO] Using pg_restore (PostgreSQL) 17.12 (Debian 17.12-0+deb13u1) (/usr/bin/pg_restore)
+2026-11-25 10:12:14 [INFO] Log file: /backups/restore-work/pg_restore_wrapper.log
+2026-11-25 10:12:14 [INFO] File map (1):
+2026-11-25 10:12:14 [INFO]   salesdb_20261125_101209.dump -> salesdb  (8.0K, custom)
+2026-11-25 10:12:14 [INFO] Checksum OK: salesdb_20261125_101209.dump
+2026-11-25 10:12:14 [INFO] Connected: server_version_num=170012
+
+RESTORE SUMMARY
+  Target     : db2.example.internal:5432  user=dba_admin
+  Source     : /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump  (1 file(s), 8.0K)
+  Files      : salesdb_20261125_101209.dump -> salesdb  (exists, 3 table(s) will be overwritten)
+  Options    : --clean --if-exists --no-owner
+  Checksums  : 1 OK
+  Backup     : 3 table(s) via pg_dump_wrapper.sh -> /backups/restore-work/pre_restore_backups/
+
+2026-11-25 10:12:14 [INFO] Approval skipped (--yes)
+2026-11-25 10:12:15 [INFO] Starting pre-restore backups (dump): 3 table(s)
+2026-11-25 10:12:15 [INFO] [salesdb] Backing up public.regions, sales.customers, sales.orders with pg_dump_wrapper.sh
+2026-11-25 10:12:15 [INFO] [salesdb] Command: bash /opt/pg-tools/pg_dump_wrapper.sh -h db2.example.internal -p 5432 -U dba_admin -d salesdb -F custom --checksum --table-sizes 0 --min-free-mb 1024 -o /backups/restore-work/pre_restore_backups/db2.example.internal_5432 --pgpassfile /home/dba/.pgpass -t \"public\".\"regions\" -t \"sales\".\"customers\" -t \"sales\".\"orders\"
+2026-11-25 10:12:15 [ERROR] [salesdb] pg_dump_wrapper.sh failed (exit 3): [ERROR] simulated backup failure 
+2026-11-25 10:12:15 [ERROR] Pre-restore backup failed; no restore was started.
+2026-11-25 10:12:15 [INFO] Summary:
+2026-11-25 10:12:15 [INFO]   DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
+2026-11-25 10:12:15 [INFO]   salesdb                  FAIL(5)   backup     -        0m00s    -
+2026-11-25 10:12:15 [INFO]   salesdb                  SKIPPED   -          8.0K     -        /backups/postgres/db1.example.internal_5432/salesdb_20261125_101209.dump
+2026-11-25 10:12:15 [ERROR] Run finished with exit code 5 (stage: backup)
+```
+
+---
+
+## 11. Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Everything restored |
+| 1 | Usage / configuration error |
+| 2 | Pre-check failed, refused (no approval, no terminal, unmapped file, existing tables without a backup) or cancelled |
+| 3 | A restore failed |
+| 4 | Checksum mismatch |
+| 5 | A pre-restore backup failed (nothing was restored) |
+| 130 | Interrupted (Ctrl-C / TERM) |
+
+Multi-file and multi-server runs exit with the highest code of any row. In a script:
+```bash
+./pg_restore_wrapper.sh --from /backups/salesdb_20261125_101209.dump -d salesdb \
+  -h db2.example.internal -U dba_admin --clean --if-exists --backup-first --yes
+rc=$?
+case $rc in
+  0) echo "restore OK" ;;
+  5) echo "backup failed, nothing was restored"; exit 5 ;;
+  *) echo "restore failed (rc=$rc), see the log"; exit "$rc" ;;
+esac
 ```
