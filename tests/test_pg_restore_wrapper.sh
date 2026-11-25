@@ -237,6 +237,7 @@ check "no restore started after the failed backup" test "$(q "$PORT" t_src "SELE
 section "Existing tables: interactive prompt (typed on a terminal)"
 tty_run 'cancel\n' "${C[@]}" --from "$SRC_NEW" -d t_src --clean --if-exists
 check "cancel -> exit 2, nothing restored" bash -c '[[ $1 -eq 2 ]] && grep -q "Back them up first? \[dump / psql / skip / cancel\]" <<<"$2" && grep -q "Cancelled at the existing-tables prompt" <<<"$2"' _ "$RC" "$OUT"
+check "prompt and Answer log are on separate lines" bash -c '! grep -qE "\]:[[:space:]]*.*\[INFO\] Answer:" <<<"$1" && grep -qE "\[INFO\] Answer: cancel$" <<<"$1"' _ "$OUT"
 check "data untouched after cancel" test "$(q "$PORT" t_src "SELECT note FROM sales.orders WHERE id=3")" = KEEP
 tty_run 'skip\noverwrite 4\n' "${C[@]}" --from "$SRC_NEW" -d t_src --clean --if-exists
 check "skip + wrong confirmation -> exit 2" bash -c '[[ $1 -eq 2 ]] && grep -q "Type OVERWRITE 4 to restore WITHOUT a backup" <<<"$2" && grep -q "Not confirmed" <<<"$2"' _ "$RC" "$OUT"
@@ -255,6 +256,7 @@ check "dump answer + wrong host name -> exit 2, cancelled" bash -c '[[ $1 -eq 2 
 check "dump answer took the backup before the approval" test "$(ls "$OUTD/pre_restore_backups/${H}_${PORT}"/t_src_*.dump | wc -l)" -eq $(( nb + 1 ))
 tty_run "$H\n" "${C[@]}" --from "$D" --map 'src_*=t_new' --include 'src_*' --create
 check "host-name approval on a terminal (no existing tables)" bash -c '[[ $1 -eq 0 ]] && grep -q "Type the target host name to continue (127.0.0.1)" <<<"$2"' _ "$RC" "$OUT"
+check "host-name prompt and Answer log are on separate lines" bash -c '! grep -qE "Type the target host name to continue \([^)]+\), anything else cancels:[[:space:]]*.*\[INFO\] Answer:" <<<"$1" && grep -qE "\[INFO\] Answer: 127\.0\.0\.1$" <<<"$1"' _ "$OUT"
 
 # ----------------------------------------------------------------------------
 section "One file fails, the others continue"

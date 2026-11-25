@@ -31,3 +31,6 @@ First release.
 - If tables already exist and `--clean` is not set, the run refuses with exit 2 unless `--data-only` is given. The existing-table backup prompt is not shown in that case.
 - The summary table is printed in servers-file order.
 - Test suite against real PostgreSQL 17, run as a non-superuser role (`tests/test_pg_restore_wrapper.sh`), including a fake `mail`/`sendmail` on PATH for e-mail alerts.
+
+**Fixed**
+- Interactive prompts (`dump / psql / skip / cancel`, `OVERWRITE N`, the host-name / `RESTORE N` approval) now print a newline after the answer is read, so the `[INFO] Answer: …` log line is not glued to the question (including when answers are piped in tests).
