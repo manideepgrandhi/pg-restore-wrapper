@@ -25,7 +25,7 @@ Settings are applied in this order (later ones win): **built-in defaults → `--
 7. **Asks for approval.** Type the exact target host name, or `RESTORE N` with `--servers` (N = number of servers that will be restored). `--yes` skips the prompt. Without `--yes`, the run needs a terminal and refuses (exit 2) when there isn't one.
 8. **Takes the backups** (if planned). Any backup failure means **no restore starts** anywhere (exit 5).
 9. **Restores** each file. A failure is `FAIL(3)`, and the other files still run unless `--stop-on-error`.
-10. **Prints the rollback commands** and saves them to `OUTPUT_DIR/rollback_<date>.sh`, then the summary table, then sends alerts.
+10. **Prints where each pre-restore backup was saved** (full dump file paths, or `<schema>.<table>_bkp_<timestamp>` table names), then the summary table, then sends alerts. The backups are kept for manual recovery; the wrapper does not roll anything back.
 
 ## Existing tables
 
@@ -33,8 +33,8 @@ These are tables in the dump that already exist in the target database (from `pg
 
 | How you run it | What happens |
 |---|---|
-| `--backup-first` or `--backup-first=dump` | After approval, `pg_dump_wrapper.sh` dumps just those tables (`-F custom --checksum -t ...`, one file per database) into `OUTPUT_DIR/pre_restore_backups/<host>_<port>/`. Rollback is a ready-made `pg_restore_wrapper.sh ... --clean --if-exists --force` command. |
-| `--backup-first=psql` | Each table is copied in the same database to `<backup-schema>.<table>_bkp_<YYYYMMDD_HHMM>` with `CREATE TABLE ... (LIKE ... INCLUDING ALL)` + `INSERT ... (columns) OVERRIDING SYSTEM VALUE SELECT columns` (generated columns are left out and recomputed). If the name is taken, `_2`, `_3`, ... is added. The schema defaults to `public` (`--backup-schema`) and is created if missing. Rollback is `TRUNCATE` + `INSERT ... SELECT` from the copy. |
+| `--backup-first` or `--backup-first=dump` | After approval, `pg_dump_wrapper.sh` dumps just those tables (`-F custom --checksum -t ...`, one file per database) into `OUTPUT_DIR/pre_restore_backups/<host>_<port>/`. The file path is printed at the end of the run and kept for manual recovery. |
+| `--backup-first=psql` | Each table is copied in the same database to `<backup-schema>.<table>_bkp_<YYYYMMDD_HHMM>` with `CREATE TABLE ... (LIKE ... INCLUDING ALL)` + `INSERT ... (columns) OVERRIDING SYSTEM VALUE SELECT columns` (generated columns are left out and recomputed). If the name is taken, `_2`, `_3`, ... is added. The schema defaults to `public` (`--backup-schema`) and is created if missing. The copy names are printed at the end of the run and kept for manual recovery. |
 | `--force` | No backup. The summary says `NONE - --force`. |
 | none of these, on a terminal | A WARNING lists the tables and asks `Back them up first? [dump / psql / skip / cancel]`. `dump`/`psql` take the backup right away, then continue to the summary and approval. `skip` needs you to type `OVERWRITE N` (N = number of tables). `cancel` or anything else stops with exit 2. |
 | none of these, with `--yes` or no terminal (cron) | Refuses with exit 2, prints the `pg_dump_wrapper.sh` command you could run, and changes nothing. |
@@ -102,7 +102,7 @@ Each line is `host,port,user,databases`. `databases` is `all` or a comma list of
 ### Files, alerts, behaviour
 | Option | Purpose |
 |---|---|
-| `-o, --output-dir DIR` | Log, rollback file and dump backups. Default `.` |
+| `-o, --output-dir DIR` | Log and dump backups. Default `.` |
 | `-l, --log-file FILE` | Default `OUTPUT_DIR/pg_restore_wrapper.log`. |
 | `--min-free-mb N` | Warn if free space in `OUTPUT_DIR` is below N MB. Default 1024. |
 | `--alert-email ADDR` | Mail the report (`mail`/`mailx`/`sendmail`). Repeatable. |
@@ -141,8 +141,7 @@ Runs with several files or servers exit with the highest code of any row.
 
 ## Known limits
 
-- `--backup-first=psql` copies and rollbacks list the columns explicitly and leave out generated columns (PostgreSQL recomputes them), so tables with `GENERATED ALWAYS AS (...) STORED` columns work.
-- The psql rollback will not run a bare `TRUNCATE` on a table that other tables (not in the backup) still reference. It warns, recommends the dump method, and comments a `TRUNCATE ... CASCADE` alternative that would also empty those referencing tables.
+- `--backup-first=psql` copies list the columns explicitly and leave out generated columns (PostgreSQL recomputes them), so tables with `GENERATED ALWAYS AS (...) STORED` columns work.
 - Restores run one file after another. `-j` gives parallelism inside one restore.
 - Tested on Linux with PostgreSQL 17 (see `tests/`). Windows Git Bash paths are handled the same way as in pg_dump_wrapper but have not been tested here.
 

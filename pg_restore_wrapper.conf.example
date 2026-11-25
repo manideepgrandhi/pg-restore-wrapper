@@ -57,7 +57,7 @@ backup_schema=public               # where psql copies go
 # assume_yes=no                    # yes = skip the typed approval (the RESTORE SUMMARY is still logged)
 
 # --- files ----------------------------------------------------------------------
-output_dir=/backups/restore-work   # log, rollback_<date>.sh, pre-restore dump backups
+output_dir=/backups/restore-work   # log and pre-restore dump backups
 # log_file=/var/log/pg_restore_wrapper.log
 min_free_mb=5120
 # verbose=no

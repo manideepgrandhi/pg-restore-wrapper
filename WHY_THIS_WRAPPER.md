@@ -9,7 +9,7 @@
 | Shows what will happen first | no | RESTORE SUMMARY: target, files → databases, options, checksums, backup plan |
 | Stops a restore into the wrong server | no | type the exact host name (or `RESTORE N` for many servers); cron needs `--yes` |
 | Existing tables | overwritten (with `--clean`) or errors | listed; backup first (pg_dump_wrapper or psql copy), `OVERWRITE N`, or cancel; refuses without `--clean` (unless `--data-only`); cron also needs `--backup-first`/`--force` |
-| Undo | your problem | rollback commands printed and saved as a script |
+| A copy first | your problem | `--backup-first` (dump or psql copy) before any restore; paths and table names printed at the end, kept for manual recovery |
 | Folder of dumps | one command per file | one run; newest dump per database; explicit `--map` |
 | Checksums | no | verifies `.sha256` from pg_dump_wrapper |
 | Missing database | error (or `-C`, which needs the right connection and owner) | `--create` makes it only when it doesn't exist |
@@ -33,7 +33,7 @@ After:
 pg_restore_wrapper.sh --from /backups/postgres/db1.example.internal_5432 --map 'salesdb_*=salesdb' \
   -h uat.example.internal -U dba_admin --clean --if-exists --no-owner -j 4 --backup-first
 ```
-You get the file it picked and why, the checksum result, the tables that exist, a summary, and the host-name prompt. Then a pg_dump_wrapper backup of exactly those tables, the restore, a summary row with `OK` or `FAIL(3) restore`, and a rollback script.
+You get the file it picked and why, the checksum result, the tables that exist, a summary, and the host-name prompt. Then a pg_dump_wrapper backup of exactly those tables, the restore, a summary row with `OK` or `FAIL(3) restore`, and a list of where those backups were saved.
 
 ## When plain pg_restore is enough
 

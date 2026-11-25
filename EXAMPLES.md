@@ -2,7 +2,7 @@
 
 Copy-paste recipes. Host names, paths and data are examples. Every command below asks for approval (type the host name) unless it has `--yes`. Add `--dry-run` first to see the plan and the exact commands without changing anything.
 
-Contents: [Basics](#basics) · [Folders and mapping](#folders-and-mapping) · [Existing tables](#existing-tables) · [Aurora / RDS](#aurora--rds) · [Plain SQL dumps](#plain-sql-dumps) · [Many servers](#many-servers) · [Config file and cron](#config-file-and-cron) · [Alerts](#alerts) · [Rollback](#rollback) · [Exit codes in scripts](#exit-codes-in-scripts) · [Real output](#real-output)
+Contents: [Basics](#basics) · [Folders and mapping](#folders-and-mapping) · [Existing tables](#existing-tables) · [Aurora / RDS](#aurora--rds) · [Plain SQL dumps](#plain-sql-dumps) · [Many servers](#many-servers) · [Config file and cron](#config-file-and-cron) · [Alerts](#alerts) · [Backup locations](#backup-locations) · [Exit codes in scripts](#exit-codes-in-scripts) · [Real output](#real-output)
 
 ## Basics
 
@@ -173,16 +173,17 @@ pg_restore_wrapper.sh --from salesdb.dump -d salesdb -h db2.example.internal --b
 ```
 Alerts go out on failure by default. A run cancelled at a prompt sends no alert, and alerts never change the exit code.
 
-## Rollback
+## Backup locations
 
-Every run with a backup prints rollback commands at the end and saves them as a script:
-```
-[INFO] Rollback commands saved (review, then run with bash): /backups/restore-work/rollback_20261125_013012.sh
-```
-- dump method: a `pg_restore_wrapper.sh --from <backup file> -d DB --clean --if-exists --force` command. It asks for approval again.
-- psql method: `TRUNCATE` + `INSERT ... SELECT` from the `_bkp_` copy in one transaction, plus a commented `DROP TABLE` for later. If other tables in the same backup reference a copied table, they are truncated together. If a table outside the backup references it, the script warns, recommends the dump method, and only comments a `TRUNCATE ... CASCADE` alternative (that would also empty those referencing tables).
+The wrapper does not roll anything back. After a run that took backups, it prints where each one was saved, and leaves them for you to use if you need to recover by hand:
 
-Read the file, then run it with `bash /backups/restore-work/rollback_20261125_013012.sh`.
+```
+[INFO] Pre-restore backups saved:
+  [dump] db2.example.internal:5432/salesdb  /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_045407.dump
+  [psql] db2.example.internal:5432/salesdb  public.orders_bkp_20261125_0454  (copy of sales.orders, 500 rows)
+```
+- dump method: one `.dump` file per database (plus its `.sha256`) under `OUTPUT_DIR/pre_restore_backups/<host>_<port>/`.
+- psql method: a table named `<backup-schema>.<table>_bkp_<YYYYMMDD_HHMM>` in the same database (`_2`, `_3` on a name collision).
 
 ## Exit codes in scripts
 
@@ -191,7 +192,7 @@ pg_restore_wrapper.sh --config /etc/pg_restore/uat.conf --yes
 case $? in
   0) echo "restored" ;;
   2) echo "refused or pre-check failed: nothing was restored" ;;
-  3) echo "a restore failed: check the log and the rollback file" ;;
+  3) echo "a restore failed: check the log and the pre-restore backups" ;;
   4) echo "checksum mismatch" ;;
   5) echo "pre-restore backup failed: nothing was restored" ;;
   *) echo "other error" ;;
@@ -243,7 +244,7 @@ pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password
 
 
 ------------------------------------------------------------------------------
-2) Same restore by hand: existing-table prompt (answer: psql), RESTORE SUMMARY, host-name approval, rollback
+2) Same restore by hand: existing-table prompt (answer: psql), RESTORE SUMMARY, host-name approval
 ------------------------------------------------------------------------------
 $ same command, no --dry-run, run by hand (answers: psql, then the host name)
 psql
@@ -279,7 +280,7 @@ RESTORE SUMMARY
                salesdb_20261125_045405.dump -> salesdb  (exists, 3 table(s) will be overwritten)
   Options    : --clean --if-exists --create -j 4 --no-owner --no-privileges
   Checksums  : 2 OK
-  Backup     : 3 table(s) already backed up (psql); rollback commands are printed at the end
+  Backup     : 3 table(s) already backed up (psql); locations are printed at the end
 
 Type the target host name to continue (db2.example.internal), anything else cancels: 2026-11-25 04:54:06 [INFO] Answer: db2.example.internal
 2026-11-25 04:54:06 [INFO] Approval accepted (db2.example.internal)
@@ -290,34 +291,10 @@ Type the target host name to continue (db2.example.internal), anything else canc
 2026-11-25 04:54:06 [INFO] [salesdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
 2026-11-25 04:54:06 [INFO] [salesdb] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password --jobs=4 --clean --if-exists --no-owner --no-privileges /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
 2026-11-25 04:54:06 [INFO] [salesdb] Restore finished in 0m00s
-2026-11-25 04:54:06 [INFO] Rollback commands (from the pre-restore backup):
-# db2.example.internal:5432/salesdb public.regions  (psql copy -> public.regions_bkp_20261125_0454, 2 rows)
-psql -h db2.example.internal -p 5432 -U dba_admin -d salesdb -v ON_ERROR_STOP=1 <<'SQL'
-BEGIN;
-TRUNCATE "public"."regions";
-INSERT INTO "public"."regions" (id, name) OVERRIDING SYSTEM VALUE SELECT id, name FROM "public"."regions_bkp_20261125_0454";
-COMMIT;
--- when no longer needed: DROP TABLE "public"."regions_bkp_20261125_0454";
-SQL
-
-# db2.example.internal:5432/salesdb sales.customers  (psql copy -> public.customers_bkp_20261125_0454, 40 rows)
-psql -h db2.example.internal -p 5432 -U dba_admin -d salesdb -v ON_ERROR_STOP=1 <<'SQL'
-BEGIN;
-TRUNCATE "sales"."customers";
-INSERT INTO "sales"."customers" (id, name) OVERRIDING SYSTEM VALUE SELECT id, name FROM "public"."customers_bkp_20261125_0454";
-COMMIT;
--- when no longer needed: DROP TABLE "public"."customers_bkp_20261125_0454";
-SQL
-
-# db2.example.internal:5432/salesdb sales.orders  (psql copy -> public.orders_bkp_20261125_0454, 500 rows)
-psql -h db2.example.internal -p 5432 -U dba_admin -d salesdb -v ON_ERROR_STOP=1 <<'SQL'
-BEGIN;
-TRUNCATE "sales"."orders";
-INSERT INTO "sales"."orders" (id, amount, note) OVERRIDING SYSTEM VALUE SELECT id, amount, note FROM "public"."orders_bkp_20261125_0454";
-COMMIT;
--- when no longer needed: DROP TABLE "public"."orders_bkp_20261125_0454";
-SQL
-2026-11-25 04:54:06 [INFO] Rollback commands saved (review, then run with bash): /backups/restore-work/rollback_20261125_045406.sh
+2026-11-25 04:54:06 [INFO] Pre-restore backups saved:
+  [psql] db2.example.internal:5432/salesdb  public.regions_bkp_20261125_0454  (copy of public.regions, 2 rows)
+  [psql] db2.example.internal:5432/salesdb  public.customers_bkp_20261125_0454  (copy of sales.customers, 40 rows)
+  [psql] db2.example.internal:5432/salesdb  public.orders_bkp_20261125_0454  (copy of sales.orders, 500 rows)
 2026-11-25 04:54:06 [INFO] Summary:
 2026-11-25 04:54:06 [INFO]   DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
 2026-11-25 04:54:06 [INFO]   hrdb                     OK        -          4.0K     0m00s    /backups/postgres/db1.example.internal_5432/hrdb_20261125_045405.dump
@@ -355,26 +332,12 @@ RESTORE SUMMARY
 2026-11-25 04:54:07 [INFO] [salesdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
 2026-11-25 04:54:07 [INFO] [salesdb] Command: pg_restore -h db2.example.internal -p 5432 -U dba_admin -d salesdb --no-password --clean --if-exists --no-owner --no-privileges /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
 2026-11-25 04:54:07 [INFO] [salesdb] Restore finished in 0m00s
-2026-11-25 04:54:07 [INFO] Rollback commands (from the pre-restore backup):
-# db2.example.internal:5432/salesdb  (pg_dump_wrapper.sh backup -> /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_045407.dump)
-bash /opt/pg-tools/pg_restore_wrapper.sh -h db2.example.internal -p 5432 -U dba_admin --from /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_045407.dump -d salesdb --clean --if-exists --force
-2026-11-25 04:54:07 [INFO] Rollback commands saved (review, then run with bash): /backups/restore-work/rollback_20261125_045407.sh
+2026-11-25 04:54:07 [INFO] Pre-restore backups saved:
+  [dump] db2.example.internal:5432/salesdb  /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_045407.dump
 2026-11-25 04:54:07 [INFO] Summary:
 2026-11-25 04:54:07 [INFO]   DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
 2026-11-25 04:54:07 [INFO]   salesdb                  OK        -          8.0K     0m00s    /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
 2026-11-25 04:54:07 [INFO] Run finished OK in 0m01s
-
-
-------------------------------------------------------------------------------
-4) The rollback file written by section 3
-------------------------------------------------------------------------------
-$ rollback file written by section 3
-#!/usr/bin/env bash
-# Rollback for the pg_restore_wrapper run started 2026-11-25 04:54:06. Review before running: bash /backups/restore-work/rollback_20261125_045407.sh
-set -e
-
-# db2.example.internal:5432/salesdb  (pg_dump_wrapper.sh backup -> /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_045407.dump)
-bash /opt/pg-tools/pg_restore_wrapper.sh -h db2.example.internal -p 5432 -U dba_admin --from /backups/restore-work/pre_restore_backups/db2.example.internal_5432/salesdb_20261125_045407.dump -d salesdb --clean --if-exists --force
 
 
 ------------------------------------------------------------------------------
@@ -538,34 +501,10 @@ Type RESTORE 1 to continue, anything else cancels: 2026-11-25 04:54:08 [INFO] An
 2026-11-25 04:54:08 [INFO] [db1.example.internal:5432/salesdb] Starting restore (custom) <- /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
 2026-11-25 04:54:08 [INFO] [db1.example.internal:5432/salesdb] Command: pg_restore -h db1.example.internal -p 5432 -U dba_admin -d salesdb --no-password --clean --if-exists --no-owner --no-privileges /backups/postgres/db1.example.internal_5432/salesdb_20261125_045405.dump
 2026-11-25 04:54:08 [INFO] [db1.example.internal:5432/salesdb] Restore finished in 0m00s
-2026-11-25 04:54:08 [INFO] Rollback commands (from the pre-restore backup):
-# db1.example.internal:5432/salesdb public.regions  (psql copy -> public.regions_bkp_20261125_0454, 3 rows)
-psql -h db1.example.internal -p 5432 -U dba_admin -d salesdb -v ON_ERROR_STOP=1 <<'SQL'
-BEGIN;
-TRUNCATE "public"."regions";
-INSERT INTO "public"."regions" (id, name) OVERRIDING SYSTEM VALUE SELECT id, name FROM "public"."regions_bkp_20261125_0454";
-COMMIT;
--- when no longer needed: DROP TABLE "public"."regions_bkp_20261125_0454";
-SQL
-
-# db1.example.internal:5432/salesdb sales.customers  (psql copy -> public.customers_bkp_20261125_0454, 40 rows)
-psql -h db1.example.internal -p 5432 -U dba_admin -d salesdb -v ON_ERROR_STOP=1 <<'SQL'
-BEGIN;
-TRUNCATE "sales"."customers";
-INSERT INTO "sales"."customers" (id, name) OVERRIDING SYSTEM VALUE SELECT id, name FROM "public"."customers_bkp_20261125_0454";
-COMMIT;
--- when no longer needed: DROP TABLE "public"."customers_bkp_20261125_0454";
-SQL
-
-# db1.example.internal:5432/salesdb sales.orders  (psql copy -> public.orders_bkp_20261125_0454, 500 rows)
-psql -h db1.example.internal -p 5432 -U dba_admin -d salesdb -v ON_ERROR_STOP=1 <<'SQL'
-BEGIN;
-TRUNCATE "sales"."orders";
-INSERT INTO "sales"."orders" (id, amount, note) OVERRIDING SYSTEM VALUE SELECT id, amount, note FROM "public"."orders_bkp_20261125_0454";
-COMMIT;
--- when no longer needed: DROP TABLE "public"."orders_bkp_20261125_0454";
-SQL
-2026-11-25 04:54:08 [INFO] Rollback commands saved (review, then run with bash): /backups/restore-work/rollback_20261125_045408.sh
+2026-11-25 04:54:08 [INFO] Pre-restore backups saved:
+  [psql] db1.example.internal:5432/salesdb  public.regions_bkp_20261125_0454  (copy of public.regions, 3 rows)
+  [psql] db1.example.internal:5432/salesdb  public.customers_bkp_20261125_0454  (copy of sales.customers, 40 rows)
+  [psql] db1.example.internal:5432/salesdb  public.orders_bkp_20261125_0454  (copy of sales.orders, 500 rows)
 2026-11-25 04:54:08 [INFO] Summary:
 2026-11-25 04:54:08 [INFO]   SERVER/DATABASE                   STATUS    STAGE      SIZE     TIME     FILE
 2026-11-25 04:54:08 [INFO]   db3.example.internal:5432         FAIL(2)   precheck   -        0m00s    -

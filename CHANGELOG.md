@@ -19,16 +19,15 @@ First release.
   - `--yes` or no terminal refuses with exit 2.
   - Any backup failure means no restore starts (exit 5).
 - RESTORE SUMMARY before every restore, always logged. Typed approval: the target host name, or `RESTORE N` with `--servers`. `--yes` skips the prompt. With no terminal and no `--yes`, the run refuses.
-- Rollback commands printed at the end and saved as `OUTPUT_DIR/rollback_<date>.sh`.
+- At the end of a run that took backups, the wrapper prints where each one was saved (dump file paths, or psql copy table names). The backups are kept for manual recovery; the wrapper does not roll anything back.
 - `--servers FILE` (`host,port,user,databases`): one run, one summary, one log, one alert. A down server is a `FAIL(2)` row. All backups run before any restore.
 - `--create` creates the target database only when it does not exist. `-j`, `--clean`, `--if-exists`, `-s`, `-a`, `-n`, `-t`, `-O`, `-x`, `--role`, `-e`, and `--` for extra arguments.
 - Aurora/RDS friendly: no superuser-only commands. `--no-owner` is the default; a `must be able to SET ROLE` failure (after `--keep-owner`) gets a hint to drop it. For plain dumps, `-O` / `-x` drop `OWNER TO` / `GRANT` / `REVOKE` lines.
-- psql backup copies and rollbacks list columns explicitly, so generated columns work.
+- psql backup copies list columns explicitly, so generated columns work.
 - Same conventions as pg_dump_wrapper: config file (`key=value`, no passwords), `.pgpass` / `--pgpassfile` / `-W`, log format, summary table, e-mail and Slack/JSON webhook alerts, `--alert-test`, `--dry-run`, `--pg-bin`.
 - Exit codes: 0 ok, 1 usage, 2 pre-check/refused/cancelled, 3 restore, 4 checksum, 5 backup, 130 interrupted.
 - `--no-owner` is the default (Aurora/RDS-safe). `--keep-owner` and config `keep_owner=yes` / `no_owner=no` opt out.
 - With `-n SCHEMA`, the wrapper runs `CREATE SCHEMA IF NOT EXISTS` for each schema actually present in the dump (shown in the RESTORE SUMMARY and in `--dry-run`).
 - If tables already exist and `--clean` is not set, the run refuses with exit 2 unless `--data-only` is given. The existing-table backup prompt is not shown in that case.
-- psql rollback checks for incoming foreign keys: tables in the same backup are truncated together; otherwise the script warns, recommends `--backup-first` (dump), and only comments a `TRUNCATE ... CASCADE` alternative.
 - The summary table is printed in servers-file order.
 - Test suite against real PostgreSQL 17, run as a non-superuser role (`tests/test_pg_restore_wrapper.sh`), including a fake `mail`/`sendmail` on PATH for e-mail alerts.
