@@ -102,7 +102,7 @@ SCHEMA_ONLY=0
 DATA_ONLY=0
 INCLUDE_SCHEMAS=()
 INCLUDE_TABLES=()
-NO_OWNER=0
+NO_OWNER=1                                # default: skip ownership (Aurora/RDS-safe); --keep-owner turns this off
 NO_PRIVILEGES=0
 ROLE=""
 EXIT_ON_ERROR=0
@@ -135,6 +135,8 @@ MULTI=0                                  # 1 with --servers
 SRV_HOSTS=(); SRV_PORTS=(); SRV_USERS=(); SRV_DBS=()
 SRV_OK=()                                # 1 = reachable and planned
 SERVER_LABEL=""
+CUR_SRV=0
+CUR_UNIT=-1
 DB_NAME=""
 BASE_USER=""
 SRC_PATHS=(); SRC_NAMES=(); SRC_FORMATS=(); SRC_DBS=(); SRC_SIZES=(); SRC_SUMS=()
@@ -150,7 +152,7 @@ declare -A CREATED=()
 BACKUP_STATE="none"                      # none | planned | done | skipped | forced
 CHOSEN_METHOD=""
 RUN_STAMP=""
-RESULTS=()                               # "label|rc|stage|size|duration|file"
+RESULTS=()                               # "sidx:uidx|label|rc|stage|size|duration|file"
 RUN_START=$SECONDS
 RUN_START_TS=""
 STAGE="init"
@@ -239,8 +241,15 @@ Restore options:
   -s, --schema-only            Restore only definitions
   -a, --data-only              Restore only data
   -n, --schema NAME            Restore only this schema                   [repeatable]
+                               Before restoring, the wrapper runs
+                               CREATE SCHEMA IF NOT EXISTS for each schema
+                               actually present in the dump (so -n works
+                               even when the schema does not exist yet)
   -t, --table NAME             Restore only this table                    [repeatable]
-  -O, --no-owner               Skip ownership commands
+  -O, --no-owner               Skip ownership commands (default)
+      --keep-owner             Restore the dump's ownership commands.
+                               On Aurora/RDS this usually fails unless the
+                               login can SET ROLE to those owners.
   -x, --no-privileges          Skip GRANT/REVOKE
       --role ROLE              SET ROLE before restoring (and before psql backups / CREATE DATABASE)
   -e, --exit-on-error          Stop pg_restore at its first error (default: pg_restore
@@ -413,6 +422,7 @@ load_config() {
             schemas|schema)     INCLUDE_SCHEMAS=(); add_list INCLUDE_SCHEMAS "$val" ;;
             tables|table)       INCLUDE_TABLES=(); add_list INCLUDE_TABLES "$val" ;;
             no_owner)           is_true "$val" && NO_OWNER=1 || NO_OWNER=0 ;;
+            keep_owner)         is_true "$val" && NO_OWNER=0 || NO_OWNER=1 ;;
             no_privileges)      is_true "$val" && NO_PRIVILEGES=1 || NO_PRIVILEGES=0 ;;
             role)               ROLE="$val" ;;
             exit_on_error)      is_true "$val" && EXIT_ON_ERROR=1 || EXIT_ON_ERROR=0 ;;
@@ -489,6 +499,7 @@ parse_args() {
             -n|--schema)        need_arg "$opt" $#; (( cli_n++ )) || INCLUDE_SCHEMAS=(); add_list INCLUDE_SCHEMAS "$2"; shift 2 ;;
             -t|--table)         need_arg "$opt" $#; (( cli_t++ )) || INCLUDE_TABLES=(); add_list INCLUDE_TABLES "$2"; shift 2 ;;
             -O|--no-owner)      NO_OWNER=1; shift ;;
+            --keep-owner)       NO_OWNER=0; shift ;;
             -x|--no-privileges) NO_PRIVILEGES=1; shift ;;
             --role)             need_arg "$opt" $#; ROLE="$2"; shift 2 ;;
             -e|--exit-on-error) EXIT_ON_ERROR=1; shift ;;
@@ -596,6 +607,7 @@ load_servers_file() {
 }
 
 use_server() {   # point DB_HOST/DB_PORT/DB_USER/SERVER_LABEL at server <index>
+    CUR_SRV="$1"
     DB_HOST="${SRV_HOSTS[$1]}"; DB_PORT="${SRV_PORTS[$1]}"; DB_USER="${SRV_USERS[$1]:-$BASE_USER}"
     if (( MULTI )); then SERVER_LABEL="$DB_HOST:$DB_PORT"; else SERVER_LABEL=""; fi
 }
@@ -784,6 +796,45 @@ dump_tables() {   # dump_tables <src-index> -> "schema<FS>table" lines (cached)
     printf '%s' "${SRC_TABLES[$i]}"
 }
 
+unit_schemas() {   # unit_schemas <unit> -> unique schema names (one per line); only when -n was given
+    (( ${#INCLUDE_SCHEMAS[@]} )) || return 0
+    local t sch
+    local -A seen=()
+    while IFS= read -r t; do
+        [[ -n "$t" ]] || continue
+        sch="${t%%"$FIELD_SEP"*}"
+        [[ -n "${seen[$sch]:-}" ]] && continue
+        seen[$sch]=1
+        printf '%s\n' "$sch"
+    done <<<"$(dump_tables "${U_SRC[$1]}")"
+}
+
+planned_schemas() {   # unique schemas that will get CREATE SCHEMA IF NOT EXISTS, one per line
+    (( ${#INCLUDE_SCHEMAS[@]} )) || return 0
+    local n t sch
+    local -A seen=()
+    for n in "${!U_SRV[@]}"; do
+        (( U_PRE_RC[n] == 0 )) || continue
+        case "${SRC_FORMATS[${U_SRC[$n]}]}" in plain|plain-gz) continue ;; esac
+        while IFS= read -r sch; do
+            [[ -n "$sch" ]] || continue
+            [[ -n "${seen[$sch]:-}" ]] && continue
+            seen[$sch]=1
+            printf '%s\n' "$sch"
+        done < <(unit_schemas "$n")
+    done
+}
+
+ensure_schemas_cmd() {   # ensure_schemas_cmd <db> schema...  -> SCMD
+    local sch
+    SCMD=("$(bin psql)" -X -w -q -v ON_ERROR_STOP=1 -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$1")
+    shift
+    [[ -n "$ROLE" ]] && SCMD+=(-c "SET ROLE $(quote_ident "$ROLE")")
+    for sch in "$@"; do
+        SCMD+=(-c "CREATE SCHEMA IF NOT EXISTS $(quote_ident "$sch")")
+    done
+}
+
 # ----------------------------------------------------------------------------
 # Target checks and plan
 # ----------------------------------------------------------------------------
@@ -872,7 +923,8 @@ options_text() {
     (( JOBS > 1 )) && o+=" -j $JOBS"; (( SCHEMA_ONLY )) && o+=" --schema-only"; (( DATA_ONLY )) && o+=" --data-only"
     for x in "${INCLUDE_SCHEMAS[@]}"; do o+=" -n $x"; done
     for x in "${INCLUDE_TABLES[@]}"; do o+=" -t $x"; done
-    (( NO_OWNER )) && o+=" --no-owner"; (( NO_PRIVILEGES )) && o+=" --no-privileges"; [[ -n "$ROLE" ]] && o+=" --role $ROLE"
+    if (( NO_OWNER )); then o+=" --no-owner"; else o+=" --keep-owner"; fi
+    (( NO_PRIVILEGES )) && o+=" --no-privileges"; [[ -n "$ROLE" ]] && o+=" --role $ROLE"
     (( EXIT_ON_ERROR )) && o+=" --exit-on-error"; (( ${#EXTRA_ARGS[@]} )) && o+=" -- ${EXTRA_ARGS[*]}"
     o="${o# }"; printf '%s' "${o:-(none)}"
 }
@@ -907,6 +959,7 @@ print_summary() {
     if (( !CHECKSUM )); then sums="not checked (--no-checksum)"
     else sums="$ok OK"; (( miss )) && sums+=", $miss missing"; (( bad )) && sums+=", $bad FAILED"; fi
     srcsize="$(du -shc -- "${SRC_PATHS[@]}" 2>/dev/null | tail -n1 | cut -f1)" || srcsize="?"
+    local schs; schs="$(planned_schemas)"
     {
         echo ""
         echo "RESTORE SUMMARY"
@@ -930,6 +983,7 @@ print_summary() {
         echo "  Options    : $(options_text)"
         echo "  Checksums  : $sums"
         echo "  Backup     : $(backup_text)"
+        [[ -n "$schs" ]] && echo "  Schemas    : CREATE SCHEMA IF NOT EXISTS for: ${schs//$'\n'/, }"
         echo ""
     } | log_block
 }
@@ -1054,34 +1108,166 @@ print_backup_commands() {   # shown when the run refuses to overwrite
 }
 
 # shellcheck disable=SC2329  # called from the EXIT trap via write_rollback
+incoming_fks() {   # incoming_fks <db> <schema> <table> -> "schema<FS>table<FS>conname" lines
+    psql_q "$1" "SELECT n.nspname, c.relname, con.conname
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_class f ON f.oid = con.confrelid
+        JOIN pg_namespace fn ON fn.oid = f.relnamespace
+        WHERE con.contype = 'f'
+          AND fn.nspname = $(quote_literal "$2") AND f.relname = $(quote_literal "$3")
+          AND NOT (n.nspname = fn.nspname AND c.relname = f.relname)
+        ORDER BY 1, 2, 3"
+}
+
+psql_rollback_block() {   # psql_rollback_block <srv> <db> <comma-separated BK_ROWS indices>
+    local s="$1" db="$2" host i r method tbl target rows sch name line fk_sch fk_rest fk_tbl fk_con pretty
+    local -a idx=() schs=() nams=() srcs=() dsts=() colsl=() rowsl=() drop=() safe=() blocked=()
+    local -A in_set=() ext_of=() int_of=()
+    local has_internal=0 out
+    IFS=',' read -ra idx <<<"$3"
+    use_server "$s"
+    host="${SRV_HOSTS[$s]}:${SRV_PORTS[$s]}"
+    for i in "${idx[@]}"; do
+        r="${BK_ROWS[$i]}"
+        IFS='|' read -r s db method tbl target rows <<<"$r"
+        sch="${tbl%%"$FIELD_SEP"*}"; name="${tbl#*"$FIELD_SEP"}"
+        in_set["$sch$FIELD_SEP$name"]=1
+        schs+=("$sch"); nams+=("$name")
+        srcs+=("$(qname "$sch" "$name")")
+        dsts+=("$(qname "${target%%"$FIELD_SEP"*}" "${target#*"$FIELD_SEP"}")")
+        colsl+=("${BK_COLS[$i]}")
+        rowsl+=("$rows")
+        drop+=("$(qname "${target%%"$FIELD_SEP"*}" "${target#*"$FIELD_SEP"}")")
+    done
+    for i in "${!schs[@]}"; do
+        out="$(incoming_fks "$db" "${schs[$i]}" "${nams[$i]}")" || out=""
+        local external="" internal=""
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            fk_sch="${line%%"$FIELD_SEP"*}"; fk_rest="${line#*"$FIELD_SEP"}"
+            fk_tbl="${fk_rest%%"$FIELD_SEP"*}"; fk_con="${fk_rest#*"$FIELD_SEP"}"
+            pretty="${fk_sch}.${fk_tbl} (${fk_con})"
+            if [[ -n "${in_set[$fk_sch$FIELD_SEP$fk_tbl]:-}" ]]; then
+                internal+="${internal:+, }$pretty"; has_internal=1
+            else
+                external+="${external:+, }$pretty"
+            fi
+        done <<<"$out"
+        ext_of[$i]="$external"
+        int_of[$i]="$internal"
+        if [[ -n "$external" ]]; then blocked+=("$i"); else safe+=("$i"); fi
+    done
+
+    if (( ${#safe[@]} )); then
+        local list="" j
+        for i in "${safe[@]}"; do list+="${list:+, }${schs[$i]}.${nams[$i]}"; done
+        printf '# %s/%s  psql copies (%s)\n' "$host" "$db" "$list"
+        printf "psql -h %s -p %s -U %s -d %s -v ON_ERROR_STOP=1 <<'SQL'\n" "${SRV_HOSTS[$s]}" "${SRV_PORTS[$s]}" "${SRV_USERS[$s]:-$BASE_USER}" "$(printf '%q' "$db")"
+        printf 'BEGIN;\n'
+        if (( has_internal )); then
+            local tr="" notes=""
+            for i in "${safe[@]}"; do
+                tr+="${tr:+, }${srcs[$i]}"
+                [[ -n "${int_of[$i]}" ]] && notes+="${notes:+; }${schs[$i]}.${nams[$i]} referenced by ${int_of[$i]}"
+            done
+            printf '%s\n' "-- Truncated together because of foreign keys: $notes"
+            printf 'TRUNCATE %s;\n' "$tr"
+            # INSERT referenced tables first (parent before child)
+            local -a indeg=() order=() q=()
+            local -A children=()
+            for i in "${safe[@]}"; do indeg[i]=0; children[$i]=""; done
+            for i in "${safe[@]}"; do
+                while IFS= read -r line; do
+                    [[ -n "$line" ]] || continue
+                    fk_sch="${line%%"$FIELD_SEP"*}"; fk_rest="${line#*"$FIELD_SEP"}"
+                    fk_tbl="${fk_rest%%"$FIELD_SEP"*}"
+                    [[ -n "${in_set[$fk_sch$FIELD_SEP$fk_tbl]:-}" ]] || continue
+                    # fk table references schs[i].nams[i], so parent is i, child is the fk table
+                    for j in "${safe[@]}"; do
+                        [[ "${schs[$j]}" == "$fk_sch" && "${nams[$j]}" == "$fk_tbl" ]] || continue
+                        children[$i]+="${children[$i]:+ }$j"
+                        indeg[j]=$(( ${indeg[j]:-0} + 1 ))
+                    done
+                done <<<"$(incoming_fks "$db" "${schs[$i]}" "${nams[$i]}")"
+            done
+            for i in "${safe[@]}"; do (( ${indeg[i]:-0} == 0 )) && q+=("$i"); done
+            while (( ${#q[@]} )); do
+                i="${q[0]}"; q=("${q[@]:1}")
+                order+=("$i")
+                for j in ${children[$i]}; do
+                    indeg[j]=$(( indeg[j] - 1 ))
+                    (( indeg[j] == 0 )) && q+=("$j")
+                done
+            done
+            for i in "${safe[@]}"; do
+                already=0
+                for j in "${order[@]}"; do [[ "$j" == "$i" ]] && already=1; done
+                (( already )) || order+=("$i")   # leftover cycle
+            done
+            for i in "${order[@]}"; do
+                printf 'INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM %s;\n' "${srcs[$i]}" "${colsl[$i]}" "${colsl[$i]}" "${dsts[$i]}"
+            done
+        else
+            for i in "${safe[@]}"; do
+                printf 'TRUNCATE %s;\nINSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM %s;\n' \
+                    "${srcs[$i]}" "${srcs[$i]}" "${colsl[$i]}" "${colsl[$i]}" "${dsts[$i]}"
+            done
+        fi
+        printf 'COMMIT;\n'
+        for i in "${safe[@]}"; do
+            printf '%s\n' "-- when no longer needed: DROP TABLE ${drop[$i]};"
+        done
+        printf 'SQL\n\n'
+    fi
+
+    for i in "${blocked[@]}"; do
+        printf '# WARNING: %s/%s %s.%s is referenced by %s.\n' "$host" "$db" "${schs[$i]}" "${nams[$i]}" "${ext_of[$i]}"
+        printf '# A plain TRUNCATE of this table will fail. Use --backup-first (dump) for a rollback that replaces the whole set.\n'
+        printf '# If you accept emptying the referencing tables too (they are NOT in this backup), you could instead run:\n'
+        printf "#   psql -h %s -p %s -U %s -d %s -v ON_ERROR_STOP=1 <<'SQL'\n" "${SRV_HOSTS[$s]}" "${SRV_PORTS[$s]}" "${SRV_USERS[$s]:-$BASE_USER}" "$(printf '%q' "$db")"
+        printf '#   BEGIN;\n'
+        printf '#   TRUNCATE %s CASCADE;   -- also empties: %s\n' "${srcs[$i]}" "${ext_of[$i]}"
+        printf '#   INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM %s;\n' "${srcs[$i]}" "${colsl[$i]}" "${colsl[$i]}" "${dsts[$i]}"
+        printf '#   COMMIT;\n'
+        printf '#   -- when no longer needed: DROP TABLE %s;\n' "${drop[$i]}"
+        printf '#   SQL\n\n'
+    done
+}
+
 rollback_text() {
-    local i r s db method tbl target rows sch name host self src dst cols
+    local i r s db method tbl target rows host self key
     (( ${#BK_ROWS[@]} )) || return 0
     self="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$SCRIPT_NAME"
-    local -A dump_done=()
+    local -A dump_done=() psql_ids=()
+    local -a psql_keys=()
     for i in "${!BK_ROWS[@]}"; do
         r="${BK_ROWS[$i]}"
         IFS='|' read -r s db method tbl target rows <<<"$r"
-        host="${SRV_HOSTS[$s]}:${SRV_PORTS[$s]}"; sch="${tbl%%"$FIELD_SEP"*}"; name="${tbl#*"$FIELD_SEP"}"
-        if [[ "$method" == psql ]]; then
-            src="$(qname "$sch" "$name")"; dst="$(qname "${target%%"$FIELD_SEP"*}" "${target#*"$FIELD_SEP"}")"; cols="${BK_COLS[$i]}"
-            printf '# %s/%s %s.%s  (psql copy -> %s.%s, %s rows)\n' "$host" "$db" "$sch" "$name" "${target%%"$FIELD_SEP"*}" "${target#*"$FIELD_SEP"}" "$rows"
-            printf "psql -h %s -p %s -U %s -d %s -v ON_ERROR_STOP=1 <<'SQL'\n" "${SRV_HOSTS[$s]}" "${SRV_PORTS[$s]}" "${SRV_USERS[$s]:-$BASE_USER}" "$(printf '%q' "$db")"
-            printf 'BEGIN;\nTRUNCATE %s;\nINSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM %s;\nCOMMIT;\n-- when no longer needed: DROP TABLE %s;\nSQL\n\n' \
-                "$src" "$src" "$cols" "$cols" "$dst" "$dst"
-        else
+        host="${SRV_HOSTS[$s]}:${SRV_PORTS[$s]}"
+        if [[ "$method" != psql ]]; then
             [[ -n "${dump_done[$target]:-}" ]] && continue
             dump_done[$target]=1
             printf '# %s/%s  (%s backup -> %s)\n' "$host" "$db" "$DUMP_WRAPPER_NAME" "$target"
             printf '%s\n\n' "$(print_cmd bash "$self" -h "${SRV_HOSTS[$s]}" -p "${SRV_PORTS[$s]}" -U "${SRV_USERS[$s]:-$BASE_USER}" --from "$target" -d "$db" --clean --if-exists --force)"
+            continue
         fi
+        key="$s|$db"
+        if [[ -z "${psql_ids[$key]+x}" ]]; then psql_keys+=("$key"); psql_ids[$key]="$i"
+        else psql_ids[$key]+=",$i"; fi
+    done
+    for key in "${psql_keys[@]}"; do
+        psql_rollback_block "${key%%|*}" "${key#*|}" "${psql_ids[$key]}"
     done
 }
 
-warn_no_clean() {   # existing tables + no --clean: pg_restore errors with "already exists" and appends rows
+refuse_no_clean() {  # existing tables + no --clean + no --data-only: refuse (exit 2)
     (( CLEAN || DATA_ONLY )) && return 0
     (( $(existing_count) > 0 )) || return 0
-    log_warn "--clean is not set: restoring over existing tables gives 'already exists' / duplicate key errors (FAIL(3)) and can add rows to the old data. For a full replace add --clean --if-exists."
+    list_existing_warning
+    print_summary
+    refuse "$(existing_count) existing table(s) would be overwritten and --clean is not set. Restoring over them would give 'already exists' / duplicate key errors and can add rows to the old data. Nothing was restored. Re-run with --clean --if-exists (full replace), or --data-only to reload data only."
 }
 
 # ----------------------------------------------------------------------------
@@ -1090,7 +1276,9 @@ warn_no_clean() {   # existing tables + no --clean: pg_restore errors with "alre
 label_for() { printf '%s' "${SERVER_LABEL:+$SERVER_LABEL/}$1"; }
 
 record() {   # record <label> <rc|skipped> <stage> <size> <secs> <file>
-    RESULTS+=("${1//|/_}|$2|$3|$4|$5|$6")
+    # Sort key is servers-file order, then unit index (down-server rows use unit 0).
+    local u="${CUR_UNIT:--1}"; (( u < 0 )) && u=0
+    RESULTS+=("$(printf '%05d:%05d' "${CUR_SRV:-0}" "$u")|${1//|/_}|$2|$3|$4|$5|$6")
     if [[ "$2" != skipped && "$2" != 0 ]]; then
         if (( $2 > WORST )); then WORST=$2; FIRST_FAIL="$3 ($1)"; fi   # stage of the row that sets the exit code
     fi
@@ -1171,6 +1359,21 @@ restore_unit() {   # restore_unit <unit>
         fi
         CREATED["${U_SRV[$n]}|$db"]=1
     fi
+    if [[ "${SRC_FORMATS[$i]}" != plain && "${SRC_FORMATS[$i]}" != plain-gz ]]; then
+        local -a schs=()
+        mapfile -t schs < <(unit_schemas "$n")
+        if (( ${#schs[@]} )); then
+            ensure_schemas_cmd "$db" "${schs[@]}"
+            STAGE="schema"
+            log_info "Ensuring schema(s) exist (-n): ${schs[*]}"
+            log_info "Command: $(print_cmd "${SCMD[@]}")"
+            if ! run_child "$out" "" "${SCMD[@]}"; then
+                log_error "CREATE SCHEMA failed: $(tr '\n\r' '  ' <"$out")"
+                record "$label" 3 schema "${SRC_SIZES[$i]}" $(( SECONDS - start )) "${SRC_PATHS[$i]}"
+                rm -f "$out"; DB_NAME=""; CUR_UNIT=-1; return 0
+            fi
+        fi
+    fi
     build_restore_cmd "$n"
     STAGE="restore"
     log_info "Starting restore (${SRC_FORMATS[$i]}) <- ${SRC_PATHS[$i]}"
@@ -1181,7 +1384,7 @@ restore_unit() {   # restore_unit <unit>
         if [[ "$l" == *"error:"* || "$l" == *ERROR:* ]]; then log_error "$l"; else log_info "$l"; fi
     done <"$out"
     if (( rc != 0 )) && grep -qE "$OWNER_ERROR_RE" "$out" && (( !NO_OWNER )); then
-        log_warn "Hint: the dump sets owners this login cannot switch to (normal on Aurora/RDS, where the master user is not a superuser). Re-run with --no-owner, or --role ROLE."
+        log_warn "Hint: the dump sets owners this login cannot switch to (normal on Aurora/RDS, where the master user is not a superuser). Re-run without --keep-owner (ownership commands are skipped by default), or use --role ROLE."
     fi
     rm -f "$out"
     if (( rc != 0 )); then
@@ -1198,12 +1401,20 @@ restore_unit() {   # restore_unit <unit>
 # ----------------------------------------------------------------------------
 # Summary table, alerts, exit
 # ----------------------------------------------------------------------------
+sorted_results() {   # RESULTS lines without the leading sort key, in servers-file then unit order
+    local r
+    (( ${#RESULTS[@]} )) || return 0
+    while IFS= read -r r; do printf '%s\n' "${r#*|}"; done < <(printf '%s\n' "${RESULTS[@]}" | LC_ALL=C sort)
+}
+
 summary_lines() {
     local r db rc stage size dur file status w=24 head="DATABASE"
+    local -a srows=()
     (( MULTI )) && head="SERVER/DATABASE"
-    for r in "${RESULTS[@]}"; do db="${r%%|*}"; (( ${#db} > w )) && w=${#db}; done
+    mapfile -t srows < <(sorted_results)
+    for r in "${srows[@]}"; do db="${r%%|*}"; (( ${#db} > w )) && w=${#db}; done
     printf "%-${w}s %-9s %-10s %-8s %-8s %s\n" "$head" "STATUS" "STAGE" "SIZE" "TIME" "FILE"
-    for r in "${RESULTS[@]}"; do
+    for r in "${srows[@]}"; do
         IFS='|' read -r db rc stage size dur file <<<"$r"
         if [[ "$rc" == skipped ]]; then status="SKIPPED"; stage="-"; dur="-"
         elif (( rc == 0 )); then status="OK"; stage="-"; dur="$(fmt_duration "$dur")"
@@ -1247,12 +1458,13 @@ build_alert_json() {
         local head="${body%%$'\n'*}" rest="${body#*$'\n'}"
         printf '{"text": "%s"}' "$(json_escape "*${head}*"$'\n''```'"${rest}"'```')"; return 0
     fi
-    for r in "${RESULTS[@]}"; do
+    while IFS= read -r r; do
+        [[ -n "$r" ]] || continue
         IFS='|' read -r db drc stage size dur file <<<"$r"
         (( first )) || rows+=","; first=0
         rows+="$(printf '{"database":"%s","exit_code":"%s","stage":"%s","size":"%s","duration_seconds":"%s","file":"%s"}' \
             "$(json_escape "$db")" "$(json_escape "$drc")" "$(json_escape "$stage")" "$(json_escape "$size")" "$(json_escape "$dur")" "$(json_escape "$file")")"
-    done
+    done < <(sorted_results)
     if (( rc != 0 )) && [[ -r "$LOG_FILE" ]]; then tailtxt="$(tail -n "$ALERT_LOG_LINES" "$LOG_FILE" | redact_text)"; fi
     printf '{"status":"%s","exit_code":%d,"failed_stage":"%s","host":"%s","server":"%s","source":"%s","started":"%s","duration_seconds":%d,"output_dir":"%s","log_file":"%s","rollback_file":"%s","databases":[%s],"log_tail":"%s","text":"%s"}' \
         "$(json_escape "$status")" "$rc" "$( (( rc != 0 )) && json_escape "$STAGE")" "$(json_escape "$(host_name)")" "$(json_escape "$(server_list)")" \
@@ -1351,7 +1563,8 @@ on_signal() {
         record "$(label_for "${U_DB[$CUR_UNIT]}")" 130 interrupted "${SRC_SIZES[${U_SRC[$CUR_UNIT]}]}" 0 "${SRC_PATHS[${U_SRC[$CUR_UNIT]}]}"
         for (( n = CUR_UNIT + 1; n < ${#U_SRV[@]}; n++ )); do
             (( U_PRE_RC[n] == 0 )) || continue
-            use_server "${U_SRV[$n]}"; record "$(label_for "${U_DB[$n]}")" skipped - "${SRC_SIZES[${U_SRC[$n]}]}" 0 "${SRC_PATHS[${U_SRC[$n]}]}"
+            use_server "${U_SRV[$n]}"; CUR_UNIT=$n
+            record "$(label_for "${U_DB[$n]}")" skipped - "${SRC_SIZES[${U_SRC[$n]}]}" 0 "${SRC_PATHS[${U_SRC[$n]}]}"
         done
     fi
     STAGE="interrupted"
@@ -1368,7 +1581,9 @@ mark_rest_skipped() {   # every planned unit -> SKIPPED (used when no restore wi
     local n
     for n in "${!U_SRV[@]}"; do
         (( U_PRE_RC[n] == 0 )) || continue
-        use_server "${U_SRV[$n]}"; record "$(label_for "${U_DB[$n]}")" skipped - "${SRC_SIZES[${U_SRC[$n]}]}" 0 "${SRC_PATHS[${U_SRC[$n]}]}"
+        use_server "${U_SRV[$n]}"; CUR_UNIT=$n
+        record "$(label_for "${U_DB[$n]}")" skipped - "${SRC_SIZES[${U_SRC[$n]}]}" 0 "${SRC_PATHS[${U_SRC[$n]}]}"
+        CUR_UNIT=-1
     done
     SERVER_LABEL=""
 }
@@ -1441,6 +1656,14 @@ dry_run_commands() {
         if [[ "${U_STATE[$n]}" == new && -z "${made["${U_SRV[$n]}|${U_DB[$n]}"]:-}" ]]; then
             create_cmd "${U_DB[$n]}"; print_cmd "${CCMD[@]}" | log_block; made["${U_SRV[$n]}|${U_DB[$n]}"]=1
         fi
+        if [[ "${SRC_FORMATS[${U_SRC[$n]}]}" != plain && "${SRC_FORMATS[${U_SRC[$n]}]}" != plain-gz ]]; then
+            local -a schs=()
+            mapfile -t schs < <(unit_schemas "$n")
+            if (( ${#schs[@]} )); then
+                ensure_schemas_cmd "${U_DB[$n]}" "${schs[@]}"
+                print_cmd "${SCMD[@]}" | log_block
+            fi
+        fi
         build_restore_cmd "$n"
         printf '%s%s\n' "${RPIPE:+$(plain_reader_text "$RPIPE")}" "$(print_cmd "${RCMD[@]}")" | log_block
     done
@@ -1497,6 +1720,7 @@ main() {
         if ! server_ready || ! plan_server "$s"; then
             (( MULTI )) || die 2 "$SRV_ERR"
             log_error "$SRV_ERR"
+            CUR_UNIT=-1
             record "$SERVER_LABEL" 2 precheck - 0 -
             continue
         fi
@@ -1506,7 +1730,9 @@ main() {
         (( U_PRE_RC[n] == 0 )) && continue
         use_server "${U_SRV[$n]}"; DB_NAME="${U_DB[$n]}"
         log_error "${SRC_NAMES[${U_SRC[$n]}]}: ${U_PRE_MSG[$n]}"; DB_NAME=""
+        CUR_UNIT=$n
         record "$(label_for "${U_DB[$n]}")" "${U_PRE_RC[$n]}" "${U_PRE_STAGE[$n]}" "${SRC_SIZES[${U_SRC[$n]}]}" 0 "${SRC_PATHS[${U_SRC[$n]}]}"
+        CUR_UNIT=-1
     done
     use_server 0; SERVER_LABEL=""
     if (( $(runnable_units) == 0 )); then
@@ -1515,7 +1741,7 @@ main() {
         die "$(( WORST ? WORST : 2 ))" "Nothing to restore."
     fi
 
-    warn_no_clean
+    refuse_no_clean
     existing_tables_gate
     print_summary
     if (( DRY_RUN )); then
@@ -1539,7 +1765,9 @@ main() {
     for n in "${!U_SRV[@]}"; do
         (( U_PRE_RC[n] == 0 )) || continue
         if (( stop )); then
-            use_server "${U_SRV[$n]}"; record "$(label_for "${U_DB[$n]}")" skipped - "${SRC_SIZES[${U_SRC[$n]}]}" 0 "${SRC_PATHS[${U_SRC[$n]}]}"; continue
+            use_server "${U_SRV[$n]}"; CUR_UNIT=$n
+            record "$(label_for "${U_DB[$n]}")" skipped - "${SRC_SIZES[${U_SRC[$n]}]}" 0 "${SRC_PATHS[${U_SRC[$n]}]}"
+            CUR_UNIT=-1; continue
         fi
         restore_unit "$n"
         if (( STOP_ON_ERROR )) && [[ "${RESULTS[-1]}" != *"|0|-|"* ]]; then log_error "Stopping after the first failure (--stop-on-error)"; stop=1; fi
